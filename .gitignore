@@ -1,0 +1,11 @@
+# Secrets
+.env
+
+# Environments / caches
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Run artifacts
+logs/

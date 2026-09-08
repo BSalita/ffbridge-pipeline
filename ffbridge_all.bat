@@ -101,8 +101,9 @@ echo [Stage 2] Building Club BridgeStats parquets...
 ::         E:\bridge\data\ffbridge\ffbridge_club_hand_records_augmented_narrow.parquet
 ::         E:\bridge\data\ffbridge\ffbridge_player_info.parquet
 ::         E:\bridge\data\ffbridge\ffbridge_clubs.parquet
-:: TIME:   re-augments each complete session. Use FFBRIDGE_SESSION_LIMIT to bound.
-::         Later: persist full augmented frames from stage 1 and map only.
+:: TIME:   re-augments each complete session into slim club_session_fragments.
+::         Reruns resume finished session fragments. Use FFBRIDGE_SESSION_LIMIT
+::         to bound a smoke test.
 set "LIMIT_ARGS="
 if defined FFBRIDGE_SESSION_LIMIT set "LIMIT_ARGS=--session-limit %FFBRIDGE_SESSION_LIMIT%"
 if not exist "%CLUB_OUT%\" mkdir "%CLUB_OUT%"
@@ -155,12 +156,15 @@ del /q "%STEP_OK%" 2>nul
 goto :eof
 
 :: usage: call :pyrun LABEL python.exe script.py [args...]
+:: Use %~1 after shift. "%1" double-quotes the already-quoted exe path,
+:: and cmd then hands python.exe to another interpreter as a script.
 :pyrun
 set "STEP_LABEL=%~1"
 shift
+set "PYEXE=%~1"
 del /q "%STEP_OK%" 2>nul
 call :now STEP_T0
-"%1" %2 %3 %4 %5 %6 %7 %8 %9 && echo.>"%STEP_OK%"
+"%PYEXE%" %2 %3 %4 %5 %6 %7 %8 %9 && echo.>"%STEP_OK%"
 if not exist "%STEP_OK%" exit /b 1
 call :toc %STEP_LABEL%
 exit /b 0

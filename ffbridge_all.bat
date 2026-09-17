@@ -101,13 +101,16 @@ echo [Stage 2] Building Club BridgeStats parquets...
 ::         E:\bridge\data\ffbridge\ffbridge_club_hand_records_augmented_narrow.parquet
 ::         E:\bridge\data\ffbridge\ffbridge_player_info.parquet
 ::         E:\bridge\data\ffbridge\ffbridge_clubs.parquet
-:: TIME:   re-augments each complete session into slim club_session_fragments.
+:: TIME:   maps complete cached sessions into slim club_session_fragments.
+::         Uses Lancelot's embedded DD table (no per-session DDS/SD redo).
 ::         Reruns resume finished session fragments. Use FFBRIDGE_SESSION_LIMIT
-::         to bound a smoke test.
+::         to bound a smoke test. FFBRIDGE_CLUB_WORKERS defaults to 8.
 set "LIMIT_ARGS="
 if defined FFBRIDGE_SESSION_LIMIT set "LIMIT_ARGS=--session-limit %FFBRIDGE_SESSION_LIMIT%"
+set "WORKER_ARGS=--workers 8"
+if defined FFBRIDGE_CLUB_WORKERS set "WORKER_ARGS=--workers %FFBRIDGE_CLUB_WORKERS%"
 if not exist "%CLUB_OUT%\" mkdir "%CLUB_OUT%"
-call :pyrun 2 "%CLUB_PY%" "%STATS%\build_ffbridge_club_parquets.py" --from-quality-cache --source-dir "%SOURCE%" --output-dir "%CLUB_OUT%" %LIMIT_ARGS%
+call :pyrun 2 "%CLUB_PY%" "%STATS%\build_ffbridge_club_parquets.py" --from-quality-cache --source-dir "%SOURCE%" --output-dir "%CLUB_OUT%" %LIMIT_ARGS% %WORKER_ARGS%
 if errorlevel 1 goto :error
 
 :: ====================================================================

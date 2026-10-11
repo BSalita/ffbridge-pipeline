@@ -1,0 +1,361 @@
+"""Train FFBridge declarer, contract, and percentage models.
+
+Uses the same mlBridge shard trainer as ACBL stage 5c, on the narrow deal
+features written by ``ffbridge_prediction_data.py``. ACBL checkpoints are not
+loaded: the column layout is different, and FFBridge has ``Declarer_Pct``
+rather than ``Pct_NS``.
+
+Default network sizes are smaller than ACBL's because this matrix is tens of
+columns, not thousands. Pass ``--epochs`` to match a longer ACBL run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+os.environ.setdefault("MPLBACKEND", "Agg")
+
+_SRC = Path(__file__).resolve().parent
+_REPO_SRC = _SRC.parent
+# The mlBridge directory itself must not go on sys.path: it contains
+# mlBridge.py, and that file would shadow the package.
+for _path in (_SRC, _REPO_SRC):
+    _text = str(_path)
+    if _text not in sys.path:
+        sys.path.insert(0, _text)
+
+import polars as pl
+
+from ffbridge_prediction_data import (
+    CATEGORICAL_FEATURES,
+    CT_FEATURES,
+    META_NAME,
+    TARGETS,
+    TEST_NAME,
+    TRAIN_NAME,
+    _ct_code_expr,
+    feature_columns,
+)
+
+
+SAVED_DIR_NAME = "SavedModels"
+
+
+def _encode_contract_types(frame: pl.DataFrame) -> pl.DataFrame:
+    exprs = []
+    for name in CT_FEATURES:
+        if name not in frame.columns:
+            continue
+        if frame.schema[name].is_numeric():
+            exprs.append(pl.col(name).cast(pl.Float32, strict=False).fill_null(0.0).fill_nan(0.0))
+        else:
+            exprs.append(_ct_code_expr(name))
+    if exprs:
+        frame = frame.with_columns(exprs)
+    return frame
+
+
+def _model_name(target: str) -> str:
+    return f"ffbridge_club_predicted_{target.lower()}_torch_model"
+
+
+def _hyperparameters(target: str) -> dict:
+    # Narrow inputs. ACBL's 2048-wide nets are sized for ~6,000 columns.
+    if target == "Declarer_Direction":
+        return {
+            "layers": [512, 256, 128],
+            "dropout": 0.10,
+            "lr": 1e-3,
+            "weight_decay": 0.0,
+            "bs": 8192,
+            "y_range": None,
+        }
+    if target == "Contract":
+        return {
+            "layers": [512, 256, 128],
+            "dropout": 0.20,
+            "lr": 3e-4,
+            "weight_decay": 0.0,
+            "bs": 8192,
+            "y_range": None,
+        }
+    return {
+        "layers": [256, 128, 64],
+        "dropout": 0.05,
+        "lr": 3e-4,
+        "weight_decay": 1e-4,
+        "bs": 8192,
+        "y_range": None,
+    }
+
+
+def _cast_categoricals(frame: pl.DataFrame, target: str) -> pl.DataFrame:
+    from mlBridge.mlBridgeLib import (
+        Contract_enum,
+        Dealer_enum,
+        Declarer_Direction_enum,
+        Vul_enum,
+    )
+
+    exprs = []
+    if "Dealer" in frame.columns:
+        exprs.append(pl.col("Dealer").cast(Dealer_enum, strict=False))
+    if "Vul" in frame.columns:
+        exprs.append(pl.col("Vul").cast(Vul_enum, strict=False))
+    if target == "Declarer_Direction":
+        exprs.append(pl.col(target).cast(Declarer_Direction_enum, strict=False))
+    elif target == "Contract":
+        exprs.append(pl.col(target).cast(Contract_enum, strict=False))
+    else:
+        exprs.append(pl.col(target).cast(pl.Float32, strict=False))
+    if exprs:
+        frame = frame.with_columns(exprs)
+    return frame.filter(pl.col(target).is_not_null())
+
+
+def prepare_target_frame(frame: pl.DataFrame, target: str) -> pl.DataFrame:
+    """Keep deal features and this target. Drop the other targets and ids."""
+    columns = feature_columns(frame)
+    missing = [name for name in columns if name not in frame.columns]
+    if missing:
+        raise ValueError(f"Training frame is missing features: {missing}")
+    out = frame.select([*columns, target])
+    out = _encode_contract_types(out)
+    if target == "Declarer_Pct":
+        out = out.filter(pl.col(target).is_not_null() & pl.col(target).is_finite())
+    out = _cast_categoricals(out, target)
+    out = out.filter(pl.col(target).is_not_null())
+    numeric = [name for name in out.columns if name not in CATEGORICAL_FEATURES and name != target]
+    if numeric:
+        out = out.with_columns(
+            [
+                pl.col(name).cast(pl.Float32, strict=False).fill_null(0.0).fill_nan(0.0)
+                for name in numeric
+                if out.schema[name].is_numeric()
+            ]
+        )
+    return out
+
+
+def _fresh_model(models_dir: Path, target: str, train_path: Path) -> bool:
+    checkpoint = models_dir / f"{_model_name(target)}.pth"
+    if not checkpoint.is_file():
+        return False
+    return checkpoint.stat().st_mtime >= train_path.stat().st_mtime
+
+
+def _score(actual: pl.Series, predicted: pl.Series, target: str) -> dict:
+    if target == "Declarer_Pct":
+        both = pl.DataFrame({"y": actual.cast(pl.Float64), "p": predicted.cast(pl.Float64)}).drop_nulls()
+        error = (both["p"] - both["y"]).abs()
+        y_std = float(both["y"].std() or 0.0)
+        p_std = float(both["p"].std() or 0.0)
+        return {
+            "rows": both.height,
+            "mae": float(error.mean()) if both.height else None,
+            "variance_ratio": (p_std / y_std) if y_std else None,
+        }
+    both = pl.DataFrame(
+        {"y": actual.cast(pl.Utf8), "p": predicted.cast(pl.Utf8)}
+    ).drop_nulls()
+    matches = both.filter(pl.col("y") == pl.col("p")).height
+    return {
+        "rows": both.height,
+        "accuracy": (matches / both.height) if both.height else None,
+    }
+
+
+def _delete_shards(models_dir: Path, model_name: str) -> None:
+    for path in models_dir.glob(f"{model_name}_shard_*.pt"):
+        path.unlink(missing_ok=True)
+
+
+def train_one(
+    train_df: pl.DataFrame,
+    test_df: pl.DataFrame,
+    target: str,
+    models_dir: Path,
+    epochs: int,
+    device: str,
+    shard_rows: int,
+) -> dict:
+    import math
+
+    from mlBridge.mlBridgeAiLib import (
+        create_torch_shards,
+        generate_and_save_schema,
+        predict_model,
+        train_model_from_shards,
+    )
+
+    hp = _hyperparameters(target)
+    model_name = _model_name(target)
+    print(f"\n{'=' * 60}\n{model_name}  device={device}  epochs={epochs}  layers={hp['layers']}")
+    working = prepare_target_frame(train_df, target)
+    print(f"Training rows: {working.height:,}  features: {working.width - 1}")
+    if working.height < 2:
+        raise SystemExit(f"Not enough training rows for {target}: {working.height}")
+
+    schema = generate_and_save_schema(
+        working,
+        models_dir,
+        model_name,
+        target,
+        layers=hp["layers"],
+        dropout=hp["dropout"],
+        apply_scaling_parameters=True,
+        y_range=hp["y_range"],
+        verbose=False,
+    )
+    rows = working.height
+    shard_count = math.ceil(rows / shard_rows) if shard_rows else 0
+    effective_shards = shard_rows if shard_count >= 2 else max(1, rows // 2)
+    create_torch_shards(working, schema, shard_rows_count=effective_shards, apply_scaling=True)
+    del working
+    try:
+        train_model_from_shards(
+            schema,
+            epochs=epochs,
+            bs=hp["bs"],
+            lr=hp["lr"],
+            weight_decay=hp["weight_decay"],
+            use_amp=device == "cuda",
+            device=device,
+            seed=42,
+            early_stop_patience=3,
+            verbose=True,
+        )
+    finally:
+        _delete_shards(models_dir, model_name)
+
+    evaluation = prepare_target_frame(test_df, target)
+    features = evaluation.drop(target)
+    predicted = predict_model(
+        models_dir,
+        model_name,
+        features,
+        device=device,
+        strict_validation=True,
+        parity_drop_non_finite=False,
+    )
+    pred_column = f"{target}_Pred"
+    if pred_column not in predicted.columns:
+        raise RuntimeError(f"predict_model did not return {pred_column}; columns={predicted.columns}")
+    if predicted.height != evaluation.height:
+        raise RuntimeError(
+            f"Prediction row count {predicted.height:,} != test rows {evaluation.height:,} for {target}"
+        )
+    metrics = _score(evaluation[target], predicted[pred_column], target)
+    metrics.update(
+        {
+            "target": target,
+            "model": model_name,
+            "train_rows": rows,
+            "features": working_feature_count(schema),
+            "device": device,
+            "epochs": epochs,
+            "layers": hp["layers"],
+        }
+    )
+    print(f"{target} test metrics: {metrics}")
+    return metrics
+
+
+def working_feature_count(schema: dict) -> int:
+    numeric = schema.get("numerical_feature_cols") or []
+    categorical = schema.get("categorical_feature_cols") or []
+    return len(numeric) + len(categorical)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Train FFBridge prediction models.")
+    parser.add_argument("--data-dir", type=Path, default=Path(r"E:\bridge\data\ffbridge"))
+    parser.add_argument("--models-dir", type=Path, default=None)
+    parser.add_argument("--target", action="append", choices=TARGETS, dest="targets")
+    parser.add_argument("--epochs", type=int, default=8)
+    parser.add_argument("--shard-rows", type=int, default=500_000)
+    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    parser.add_argument("--if-stale", action="store_true")
+    args = parser.parse_args(argv)
+
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+    try:
+        import torch
+    except ImportError as exc:
+        raise SystemExit(
+            "PyTorch is not installed in this interpreter. "
+            "ffbridge_all.bat uses acbl-pipeline\\.venv, which has the CUDA build."
+        ) from exc
+
+    if args.device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device = args.device
+    if device == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("CUDA was requested but torch.cuda.is_available() is false.")
+
+    train_path = args.data_dir / TRAIN_NAME
+    test_path = args.data_dir / TEST_NAME
+    if not train_path.is_file() or not test_path.is_file():
+        raise SystemExit(
+            f"Missing {train_path.name} or {test_path.name}. Run ffbridge_prediction_data.py first."
+        )
+    models_dir = args.models_dir or (args.data_dir / SAVED_DIR_NAME)
+    models_dir.mkdir(parents=True, exist_ok=True)
+    targets = list(args.targets) if args.targets else list(TARGETS)
+
+    pending = []
+    for target in targets:
+        if args.if_stale and _fresh_model(models_dir, target, train_path):
+            print(f"Keeping {_model_name(target)}.pth; it is newer than {train_path.name}.")
+            continue
+        pending.append(target)
+    if not pending:
+        print("Prediction models are up to date.")
+        return 0
+
+    print(f"Loading {train_path.name}...")
+    train_df = pl.read_parquet(train_path)
+    print(f"Loading {test_path.name}...")
+    test_df = pl.read_parquet(test_path)
+
+    all_metrics = []
+    metrics_path = args.data_dir / "ffbridge_prediction_metrics.json"
+    if metrics_path.is_file():
+        try:
+            all_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            all_metrics = []
+    by_target = {item.get("target"): item for item in all_metrics if isinstance(item, dict)}
+
+    for target in pending:
+        by_target[target] = train_one(
+            train_df,
+            test_df,
+            target,
+            models_dir,
+            epochs=args.epochs,
+            device=device,
+            shard_rows=args.shard_rows,
+        )
+    ordered = [by_target[name] for name in TARGETS if name in by_target]
+    metrics_path.write_text(json.dumps(ordered, indent=2), encoding="utf-8")
+    meta_path = args.data_dir / META_NAME
+    print(f"Wrote {metrics_path}")
+    if meta_path.is_file():
+        print(f"Feature list: {meta_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -7,6 +7,7 @@ setlocal EnableExtensions
 :: Produces data files consumed by:
 ::   ..\bridgestats-ffbridge  (Club board-results / hand-records / lookups)
 ::   ..\elo                   (quality sidecars, after stage 1 copy)
+::   E:\bridge\data\ffbridge\SavedModels  (stage 5 prediction checkpoints)
 ::
 :: Writes Club parquets to E:\bridge\data\ffbridge. bridgestats-ffbridge\u.bat
 :: then copies them into that app's data\ and publishes to prod.
@@ -16,8 +17,10 @@ setlocal EnableExtensions
 set "SRC=%~dp0.."
 set "ELO=%SRC%\elo"
 set "STATS=%SRC%\bridgestats-ffbridge"
+set "ACBL=%SRC%\acbl-pipeline"
 set "ELO_PY=%ELO%\.venv\Scripts\python.exe"
 set "STATS_PY=%STATS%\.venv\Scripts\python.exe"
+set "ACBL_PY=%ACBL%\.venv\Scripts\python.exe"
 if exist "%STATS_PY%" (
     set "CLUB_PY=%STATS_PY%"
 ) else (
@@ -132,6 +135,54 @@ if not "%U_EXIT%"=="0" (
     goto :error
 )
 
+:: ====================================================================
+:: STAGE 5: PREDICTION MODELS
+:: ACBL 5a/5b build a ~6,000-column matrix and join ACBL seat Elo.
+:: FFBridge Club files are the narrow deal matrix, so 5a and 5b are one
+:: step: join boards to hand features, synthesize Contract, temporal-split.
+:: Pre-session scratch Elo is attached when elo_cache\*.results.parquet
+:: exists (session_id = tournament_id). Otherwise the models train on the
+:: deal alone. ACBL checkpoints are not loaded.
+:: 5c uses the ACBL venv because that interpreter has the CUDA PyTorch
+:: build. The Elo venv does not.
+:: ====================================================================
+echo.
+echo [Stage 5] Prediction models...
+if not exist "%ACBL_PY%" (
+    echo *** FAILED: ACBL venv not found: %ACBL_PY%
+    echo Stage 5 needs PyTorch. Create it from ..\acbl-pipeline or install torch into that venv.
+    set "STEP_LABEL=5"
+    goto :error
+)
+
+:: ---- 5a/5b ----
+:: READS:  E:\bridge\data\ffbridge\ffbridge_club_board_results_augmented.parquet
+::         E:\bridge\data\ffbridge\ffbridge_club_hand_records_augmented_narrow.parquet
+::         optional elo_cache\*.results.parquet (scratch Elo before the session)
+:: WRITES: E:\bridge\data\ffbridge\ffbridge_prediction_data_train.parquet
+::         E:\bridge\data\ffbridge\ffbridge_prediction_data_test.parquet
+::         E:\bridge\data\ffbridge\ffbridge_prediction_data_meta.json
+:: TIME:   one join of the narrow files, then a date split at 2026-01-01.
+::         --if-stale skips the rewrite when those outputs are newer than
+::         the club parquets (and the Elo results file, when one is used).
+echo   [5a/5b] Building prediction train/test data...
+call :pyrun 5a "%ACBL_PY%" "%~dp0ffbridge_prediction_data.py" --club-dir "%CLUB_OUT%" --output-dir "%CLUB_OUT%" --if-stale
+if errorlevel 1 goto :error
+
+:: ---- 5c ----
+:: READS:  the train/test parquets from 5a/5b
+:: WRITES: E:\bridge\data\ffbridge\SavedModels\ffbridge_club_predicted_*_torch_model.pth
+::         E:\bridge\data\ffbridge\SavedModels\*_schema.json
+::         E:\bridge\data\ffbridge\ffbridge_prediction_metrics.json
+:: TIME:   three models (Declarer_Direction, Contract, Declarer_Pct) on the
+::         narrow feature set. Epochs default to 8 with early stopping.
+::         --if-stale skips a target whose .pth is newer than the train parquet.
+::         Shard files are removed after each target.
+echo   [5c] Training prediction models...
+set MPLBACKEND=Agg
+call :pyrun 5c "%ACBL_PY%" "%~dp0ffbridge_prediction_train.py" --data-dir "%CLUB_OUT%" --if-stale
+if errorlevel 1 goto :error
+
 echo.
 echo ======================================================================
 echo  Pipeline complete: %date% %time%
@@ -154,6 +205,11 @@ echo  ..\elo:
 echo    ffbridge_quality_boards.parquet
 echo    ffbridge_quality_players.parquet
 echo    ffbridge_quality_pairs.parquet
+echo.
+echo  SavedModels:
+echo    ffbridge_club_predicted_declarer_direction_torch_model.pth
+echo    ffbridge_club_predicted_contract_torch_model.pth
+echo    ffbridge_club_predicted_declarer_pct_torch_model.pth
 echo ======================================================================
 del /q "%STEP_OK%" 2>nul
 goto :eof

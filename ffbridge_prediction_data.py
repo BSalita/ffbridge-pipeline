@@ -119,6 +119,9 @@ def find_elo_results(explicit: str | None) -> Path | None:
     cache_dir = os.environ.get("FFBRIDGE_CACHE_DIR")
     if cache_dir:
         roots.append(Path(cache_dir) / "elo_cache")
+    # The deployed Elo and postmortem containers mount src/data at /data.
+    # Local pipeline runs use the same canonical host tree.
+    roots.append(Path(__file__).resolve().parent.parent / "data" / "ffbridge" / "elo_cache")
     roots.append(Path(__file__).resolve().parent.parent / "elo" / "data" / "ffbridge" / "elo_cache")
     roots.append(DEFAULT_CLUB_DIR / "elo_cache")
     found: list[Path] = []

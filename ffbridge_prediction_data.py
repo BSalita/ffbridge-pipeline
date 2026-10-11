@@ -127,7 +127,7 @@ def find_elo_results(explicit: str | None) -> Path | None:
     found: list[Path] = []
     for root in roots:
         if root.is_dir():
-            found.extend(root.glob("*.results.parquet"))
+            found.extend(root.glob("*Lancelot_API*.results.parquet"))
     if not found:
         return None
     return max(found, key=lambda path: path.stat().st_mtime)

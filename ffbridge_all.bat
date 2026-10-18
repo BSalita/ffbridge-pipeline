@@ -7,7 +7,7 @@ setlocal EnableExtensions
 :: Produces data files consumed by:
 ::   ..\bridgestats-ffbridge  (Club board-results / hand-records / lookups)
 ::   ..\elo                   (quality sidecars, after stage 1 copy)
-::   E:\bridge\data\ffbridge\SavedModels  (stage 5 prediction checkpoints)
+::   E:\bridge\data\ffbridge\SavedModels  (stage 5 checkpoints and history tables)
 ::
 :: Writes Club parquets to E:\bridge\data\ffbridge. bridgestats-ffbridge\u.bat
 :: then copies them into that app's data\ and publishes to prod.
@@ -139,10 +139,12 @@ if not "%U_EXIT%"=="0" (
 :: STAGE 5: PREDICTION MODELS
 :: ACBL 5a/5b build a ~6,000-column matrix and join ACBL seat Elo.
 :: FFBridge Club files are the narrow deal matrix, so 5a and 5b are one
-:: step: join boards to hand features, synthesize Contract, temporal-split.
-:: Pre-session scratch Elo is attached when elo_cache\*.results.parquet
-:: exists (session_id = tournament_id). Otherwise the models train on the
-:: deal alone. ACBL checkpoints are not loaded.
+:: step: join boards to hand features plus all-seat suit lengths from PBN,
+:: attach each player's and partnership's record from earlier days,
+:: synthesize Contract, temporal-split. Pre-session scratch Elo is attached
+:: when elo_cache\*.results.parquet exists (session_id = tournament_id).
+:: Feature code shared with the postmortem: ..\mlBridge\ffbridge_prediction_features.py.
+:: ACBL checkpoints are not loaded.
 :: 5c uses the ACBL venv because that interpreter has the CUDA PyTorch
 :: build. The Elo venv does not.
 :: ====================================================================
@@ -162,7 +164,12 @@ if not exist "%ACBL_PY%" (
 :: WRITES: E:\bridge\data\ffbridge\ffbridge_prediction_data_train.parquet
 ::         E:\bridge\data\ffbridge\ffbridge_prediction_data_test.parquet
 ::         E:\bridge\data\ffbridge\ffbridge_prediction_data_meta.json
-:: TIME:   one join of the narrow files, then a date split at 2026-01-01.
+::         E:\bridge\data\ffbridge\SavedModels\ffbridge_prediction_player_history.parquet
+::         E:\bridge\data\ffbridge\SavedModels\ffbridge_prediction_pair_history.parquet
+::           (running player/partnership totals; the postmortem looks
+::           players up in these, so they ship with the checkpoints)
+:: TIME:   MEASURED 2026-10-18: 43s for 9.59M boards (history tables 4s,
+::         as-of lookups 20s), 87 features. Date split at 2026-01-01.
 ::         --if-stale skips the rewrite when those outputs are newer than
 ::         the club parquets (and the Elo results file, when one is used).
 echo   [5a/5b] Building prediction train/test data...
@@ -174,10 +181,18 @@ if errorlevel 1 goto :error
 :: WRITES: E:\bridge\data\ffbridge\SavedModels\ffbridge_club_predicted_*_torch_model.pth
 ::         E:\bridge\data\ffbridge\SavedModels\*_schema.json
 ::         E:\bridge\data\ffbridge\ffbridge_prediction_metrics.json
-:: TIME:   three models (Declarer_Direction, Contract, Declarer_Pct) on the
-::         narrow feature set. Epochs default to 8 with early stopping.
+::           (per-target accuracy/MAE, club-rank Spearman per club session
+::           vs an Elo-gap line, and the joint contract/declarer pick)
+:: TIME:   MEASURED 2026-10-18: 291s for three models (Declarer_Direction,
+::         Contract, Pct_NS) on 7.37M train rows, CUDA. Epochs default to 8
+::         with early stopping (20 epochs gave the same best epoch).
 ::         --if-stale skips a target whose .pth is newer than the train parquet.
 ::         Shard files are removed after each target.
+:: ACCURACY 2026 test (2.22M boards): Declarer_Direction 0.6575 (joint 0.6630),
+::         Contract 0.3835 (joint 0.3864), Pct_NS MAE 0.2316, club-rank
+::         Spearman 0.532 vs Elo line 0.512 (10,630 club sessions).
+:: PUBLISH: ..\elo\u.bat (run by ..\u_all.bat) copies SavedModels to src\data
+::         and X1; restart the postmortem container to stage them.
 echo   [5c] Training prediction models...
 set MPLBACKEND=Agg
 call :pyrun 5c "%ACBL_PY%" "%~dp0ffbridge_prediction_train.py" --data-dir "%CLUB_OUT%" --if-stale
@@ -206,10 +221,12 @@ echo    ffbridge_quality_boards.parquet
 echo    ffbridge_quality_players.parquet
 echo    ffbridge_quality_pairs.parquet
 echo.
-echo  SavedModels:
+echo  SavedModels (published by ..\elo\u.bat):
 echo    ffbridge_club_predicted_declarer_direction_torch_model.pth
 echo    ffbridge_club_predicted_contract_torch_model.pth
-echo    ffbridge_club_predicted_declarer_pct_torch_model.pth
+echo    ffbridge_club_predicted_pct_ns_torch_model.pth
+echo    ffbridge_prediction_player_history.parquet
+echo    ffbridge_prediction_pair_history.parquet
 echo ======================================================================
 del /q "%STEP_OK%" 2>nul
 goto :eof

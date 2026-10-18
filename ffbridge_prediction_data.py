@@ -15,6 +15,11 @@ counterpart of those two stages:
 Score rows, tricks, and the auction itself are not features. ``Contract`` and
 ``Declarer_Direction`` are targets only, so the percentage model does not see
 the auction.
+
+The percentage target is North-South's matchpoint percentage, not the
+declarer's. The declarer is North-South at some tables and East-West at
+others, so the declarer's percentage has no relation to the NS-EW strength
+gap; NS percentage does.
 """
 
 from __future__ import annotations
@@ -35,7 +40,7 @@ TRAIN_NAME = "ffbridge_prediction_data_train.parquet"
 TEST_NAME = "ffbridge_prediction_data_test.parquet"
 META_NAME = "ffbridge_prediction_data_meta.json"
 
-TARGETS = ("Declarer_Direction", "Contract", "Declarer_Pct")
+TARGETS = ("Declarer_Direction", "Contract", "Pct_NS")
 
 # Deal facts known before the auction. SL_N_ML_SJ is an integer on the narrow
 # hand file, not the ACBL suit-shape string, so it is renamed before training
@@ -79,8 +84,13 @@ RENAMES = {"SL_N_ML_SJ": "SL_N_Longest"}
 CT_FEATURES = ("CT_N_S", "CT_N_H", "CT_N_D", "CT_N_C", "CT_N_N")
 CT_CODES = {"Pass": 0.0, "Partial": 1.0, "Game": 2.0, "SSlam": 3.0, "GSlam": 4.0}
 CATEGORICAL_FEATURES = ("Dealer", "Vul")
-ELO_FEATURES = ("Elo_N", "Elo_E", "Elo_S", "Elo_W", "Elo_NS", "Elo_EW")
-META_COLUMNS = ("session_id", "Date", "Board", "PBN")
+BASE_ELO_FEATURES = ("Elo_N", "Elo_E", "Elo_S", "Elo_W", "Elo_NS", "Elo_EW")
+# Missing flags are taken before the fill, the gap after it. Serving fills a
+# missing rating with the schema mean, so training fills with the mean too.
+DERIVED_ELO_FEATURES = ("Elo_Gap", "Elo_NS_Missing", "Elo_EW_Missing")
+ELO_FEATURES = (*BASE_ELO_FEATURES, *DERIVED_ELO_FEATURES)
+# Not features. Kept so pair-session ranks can be evaluated per club.
+META_COLUMNS = ("session_id", "Club", "Date", "Board", "PBN", "Pair_Key_NS", "Pair_Key_EW")
 # Below this fraction of rows with a North seat Elo, the join missed and the
 # Elo columns would be almost entirely a fill value.
 MIN_ELO_MATCH_RATE = 0.05
@@ -170,7 +180,33 @@ def build_labels() -> list[pl.Expr]:
         .otherwise(pl.lit("NULL"))
         .alias("Declarer_Direction")
     )
-    return [contract, direction]
+    declarer_pct = pl.col("Declarer_Pct").cast(pl.Float64, strict=False)
+    pct_ns = (
+        pl.when(played & pl.col("Declarer_Direction").is_in(["N", "S"]))
+        .then(declarer_pct)
+        .when(played & pl.col("Declarer_Direction").is_in(["E", "W"]))
+        .then(1.0 - declarer_pct)
+        .otherwise(None)
+        .alias("Pct_NS")
+    )
+    return [contract, direction, pct_ns]
+
+
+def pair_key_columns() -> list[pl.Expr]:
+    """Order-independent partnership keys, built before player ids are dropped."""
+    exprs = []
+    for name, left, right in (("Pair_Key_NS", "N", "S"), ("Pair_Key_EW", "E", "W")):
+        a = _id_expr(f"Player_ID_{left}")
+        b = _id_expr(f"Player_ID_{right}")
+        exprs.append(
+            pl.when(a.is_null() | b.is_null() | (a == "") | (b == ""))
+            .then(None)
+            .when(a <= b)
+            .then(a + pl.lit("|") + b)
+            .otherwise(b + pl.lit("|") + a)
+            .alias(name)
+        )
+    return exprs
 
 
 def _join_deals(club_dir: Path, max_rows: int | None, cutoff: date) -> pl.DataFrame:
@@ -183,6 +219,7 @@ def _join_deals(club_dir: Path, max_rows: int | None, cutoff: date) -> pl.DataFr
 
     board_columns = [
         "session_id",
+        "Club",
         "Date",
         "Board",
         "PBN",
@@ -202,8 +239,10 @@ def _join_deals(club_dir: Path, max_rows: int | None, cutoff: date) -> pl.DataFr
         subset=["PBN"], keep="first"
     )
     boards = pl.scan_parquet(boards_path).select(board_columns)
-    joined = boards.join(hands, on="PBN", how="inner").with_columns(build_labels())
-    joined = joined.drop("BidLvl", "BidSuit", "Dbl")
+    joined = boards.join(hands, on="PBN", how="inner").with_columns(
+        *build_labels(), *pair_key_columns()
+    )
+    joined = joined.drop("BidLvl", "BidSuit", "Dbl", "Declarer_Pct")
     if max_rows:
         train_part = joined.filter(pl.col("Date") < cutoff).head(max_rows)
         test_part = joined.filter(pl.col("Date") >= cutoff).head(max(1, max_rows // 4))
@@ -217,7 +256,9 @@ def attach_scratch_elo(frame: pl.DataFrame, results_path: Path) -> tuple[pl.Data
     """Join pre-session scratch Elo onto the four seats and the two pairs.
 
     Uses Elo *before* the session only. After-session ratings are the result
-    of these boards and would leak the target.
+    of these boards and would leak the target. ``scratch_pair_elo`` is the
+    mean of the two *after* ratings, so the pair rating is rebuilt here from
+    the two before ratings. The NS pair's ``club_id`` fills ``Club``.
     """
     schema = pl.read_parquet_schema(results_path)
     required = {
@@ -226,7 +267,7 @@ def attach_scratch_elo(frame: pl.DataFrame, results_path: Path) -> tuple[pl.Data
         "player2_id",
         "player1_scratch_elo_before",
         "player2_scratch_elo_before",
-        "scratch_pair_elo",
+        "club_id",
     }
     missing = sorted(required - set(schema))
     if missing:
@@ -241,8 +282,9 @@ def attach_scratch_elo(frame: pl.DataFrame, results_path: Path) -> tuple[pl.Data
             _id_expr("player2_id").alias("p2"),
             pl.col("player1_scratch_elo_before").cast(pl.Float32).alias("e1"),
             pl.col("player2_scratch_elo_before").cast(pl.Float32).alias("e2"),
-            pl.col("scratch_pair_elo").cast(pl.Float32).alias("pair_elo"),
+            _id_expr("club_id").alias("club_id"),
         )
+        .with_columns(((pl.col("e1") + pl.col("e2")) / 2.0).alias("pair_elo"))
         .collect()
     )
     players = pl.concat(
@@ -262,9 +304,10 @@ def attach_scratch_elo(frame: pl.DataFrame, results_path: Path) -> tuple[pl.Data
             pl.min_horizontal("p1", "p2").alias("a"),
             pl.max_horizontal("p1", "p2").alias("b"),
             "pair_elo",
+            "club_id",
         )
         .group_by(["session_id", "a", "b"])
-        .agg(pl.col("pair_elo").mean())
+        .agg(pl.col("pair_elo").mean(), pl.col("club_id").drop_nulls().first())
     )
 
     out = frame.with_columns(_id_expr("session_id").alias("_sid"))
@@ -287,11 +330,17 @@ def attach_scratch_elo(frame: pl.DataFrame, results_path: Path) -> tuple[pl.Data
             pl.max_horizontal(_id_expr(f"Player_ID_{left}"), _id_expr(f"Player_ID_{right}")).alias("b"),
         ).with_row_index("_row")
         lookup = keys.join(pairs, on=["session_id", "a", "b"], how="left").select(
-            "_row", pl.col("pair_elo").alias(f"Elo_{pair_name}")
+            "_row",
+            pl.col("pair_elo").alias(f"Elo_{pair_name}"),
+            pl.col("club_id").alias(f"_club_{pair_name}"),
         )
         out = out.with_row_index("_row").join(lookup, on="_row", how="left").drop("_row")
         if out.height != height:
             raise RuntimeError(f"Elo pair join for {pair_name} changed the row count")
+    out = out.with_columns(
+        pl.coalesce(pl.col("Club").cast(pl.Utf8), pl.col("_club_NS"), pl.col("_club_EW")).alias("Club")
+    ).drop("_club_NS", "_club_EW")
+    print(f"Club known on {out['Club'].is_not_null().mean():.1%} of rows")
 
     matched = out.filter(pl.col("Elo_N").is_not_null()).height
     rate = matched / height if height else 0.0
@@ -299,12 +348,17 @@ def attach_scratch_elo(frame: pl.DataFrame, results_path: Path) -> tuple[pl.Data
     player_ids = [f"Player_ID_{seat}" for seat in "NESW"]
     if rate < MIN_ELO_MATCH_RATE:
         print("Elo match rate is below 5%; dropping Elo columns so they are not trained as a fill value.")
-        return out.drop("_sid", *ELO_FEATURES, *player_ids), False
+        return out.drop("_sid", *BASE_ELO_FEATURES, *player_ids), False
 
-    for column in ELO_FEATURES:
-        median = out.select(pl.col(column).median()).item()
-        fill = 0.0 if median is None else float(median)
+    out = out.with_columns(
+        pl.col("Elo_NS").is_null().cast(pl.Float32).alias("Elo_NS_Missing"),
+        pl.col("Elo_EW").is_null().cast(pl.Float32).alias("Elo_EW_Missing"),
+    )
+    for column in BASE_ELO_FEATURES:
+        mean = out.select(pl.col(column).mean()).item()
+        fill = 0.0 if mean is None else float(mean)
         out = out.with_columns(pl.col(column).fill_null(fill).fill_nan(fill).cast(pl.Float32))
+    out = out.with_columns((pl.col("Elo_NS") - pl.col("Elo_EW")).alias("Elo_Gap"))
     return out.drop("_sid", *player_ids), True
 
 
@@ -332,7 +386,7 @@ def _cast_model_columns(frame: pl.DataFrame) -> pl.DataFrame:
     for name in CATEGORICAL_FEATURES:
         if name in frame.columns:
             exprs.append(pl.col(name).cast(pl.Utf8).alias(name))
-    exprs.append(pl.col("Declarer_Pct").cast(pl.Float32, strict=False))
+    exprs.append(pl.col("Pct_NS").cast(pl.Float32, strict=False))
     exprs.append(pl.col("Contract").cast(pl.Utf8))
     exprs.append(pl.col("Declarer_Direction").cast(pl.Utf8))
     return frame.with_columns(exprs)
@@ -382,7 +436,7 @@ def build_prediction_data(
         "elo_results": str(elo_results) if used_elo and elo_results else None,
         "max_rows": max_rows,
         "contract": "level + strain + double + declarer, or PASS",
-        "score_target": "Declarer_Pct",
+        "score_target": "Pct_NS",
     }
     (output_dir / META_NAME).write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(

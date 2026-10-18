@@ -2,8 +2,13 @@
 
 Uses the same mlBridge shard trainer as ACBL stage 5c, on the narrow deal
 features written by ``ffbridge_prediction_data.py``. ACBL checkpoints are not
-loaded: the column layout is different, and FFBridge has ``Declarer_Pct``
-rather than ``Pct_NS``.
+loaded: the column layout is different.
+
+``Pct_NS`` is also scored the way the postmortem uses it: predictions are
+averaged per pair-session and compared with actual pair percentages by rank
+correlation within each club session, both raw and centered on each board.
+An Elo-gap line fitted on the training rows is the baseline the model has
+to beat.
 
 Default network sizes are smaller than ACBL's because this matrix is tens of
 columns, not thousands. Pass ``--epochs`` to match a longer ACBL run.
@@ -126,7 +131,7 @@ def prepare_target_frame(frame: pl.DataFrame, target: str) -> pl.DataFrame:
         raise ValueError(f"Training frame is missing features: {missing}")
     out = frame.select([*columns, target])
     out = _encode_contract_types(out)
-    if target == "Declarer_Pct":
+    if target == "Pct_NS":
         out = out.filter(pl.col(target).is_not_null() & pl.col(target).is_finite())
     out = _cast_categoricals(out, target)
     out = out.filter(pl.col(target).is_not_null())
@@ -150,7 +155,7 @@ def _fresh_model(models_dir: Path, target: str, train_path: Path) -> bool:
 
 
 def _score(actual: pl.Series, predicted: pl.Series, target: str) -> dict:
-    if target == "Declarer_Pct":
+    if target == "Pct_NS":
         both = pl.DataFrame({"y": actual.cast(pl.Float64), "p": predicted.cast(pl.Float64)}).drop_nulls()
         error = (both["p"] - both["y"]).abs()
         y_std = float(both["y"].std() or 0.0)
@@ -158,6 +163,7 @@ def _score(actual: pl.Series, predicted: pl.Series, target: str) -> dict:
         return {
             "rows": both.height,
             "mae": float(error.mean()) if both.height else None,
+            "mae_constant_half": float((both["y"] - 0.5).abs().mean()) if both.height else None,
             "variance_ratio": (p_std / y_std) if y_std else None,
         }
     both = pl.DataFrame(
@@ -168,6 +174,99 @@ def _score(actual: pl.Series, predicted: pl.Series, target: str) -> dict:
         "rows": both.height,
         "accuracy": (matches / both.height) if both.height else None,
     }
+
+
+MIN_PAIR_BOARDS = 8
+MIN_CLUB_PAIRS = 4
+
+
+def elo_gap_line(train_df: pl.DataFrame) -> tuple[float, float]:
+    """Least-squares ``Pct_NS = intercept + slope * Elo_Gap`` on the training rows."""
+    rows = train_df.filter(pl.col("Pct_NS").is_not_null() & pl.col("Pct_NS").is_finite())
+    stats = rows.select(
+        pl.col("Elo_Gap").cast(pl.Float64).mean().alias("mx"),
+        pl.col("Pct_NS").cast(pl.Float64).mean().alias("my"),
+        pl.cov(pl.col("Elo_Gap").cast(pl.Float64), pl.col("Pct_NS").cast(pl.Float64)).alias("cxy"),
+        pl.col("Elo_Gap").cast(pl.Float64).var().alias("vx"),
+    ).row(0, named=True)
+    if not stats["vx"]:
+        raise ValueError("Elo_Gap has no variance in the training rows")
+    slope = stats["cxy"] / stats["vx"]
+    return stats["my"] - slope * stats["mx"], slope
+
+
+def center_per_board(column: str) -> pl.Expr:
+    """Shift each club board to a 50% mean, the way matchpoints average."""
+    board = ["session_id", "Club", "Board"]
+    return (pl.col(column) - pl.col(column).mean().over(board) + 0.5).clip(0.0, 1.0)
+
+
+def pair_session_rank_quality(frame: pl.DataFrame, columns: list[str]) -> dict:
+    """Spearman correlation of predicted and actual pair percentage per club session.
+
+    North-South pairs score ``Pct_NS``; East-West pairs score its complement on
+    the same rows. Both directions are ranked together, as ``Club_Rank`` is.
+    """
+    def side_score(name: str, east_west: bool) -> pl.Expr:
+        return (1.0 - pl.col(name)) if east_west else pl.col(name)
+
+    pieces = []
+    for key, east_west in (("Pair_Key_NS", False), ("Pair_Key_EW", True)):
+        pieces.append(
+            frame.filter(pl.col(key).is_not_null())
+            .group_by(["session_id", "Club", key])
+            .agg(
+                side_score("Pct_NS", east_west).mean().alias("actual"),
+                *[side_score(name, east_west).mean().alias(name) for name in columns],
+                pl.len().alias("boards"),
+            )
+            .filter(pl.col("boards") >= MIN_PAIR_BOARDS)
+            .drop(key)
+        )
+    pairs = pl.concat(pieces, how="vertical")
+    clubs = (
+        pairs.group_by(["session_id", "Club"])
+        .agg(
+            pl.len().alias("pairs"),
+            *[
+                pl.corr(name, "actual", method="spearman").alias(name)
+                for name in columns
+            ],
+        )
+        .filter(pl.col("pairs") >= MIN_CLUB_PAIRS)
+    )
+    result = {"club_sessions": clubs.height, "pairs": int(clubs["pairs"].sum())}
+    for name in columns:
+        result[name] = {
+            "mean_spearman": float(clubs[name].fill_nan(None).mean()),
+            "pair_mae": float((pairs[name] - pairs["actual"]).abs().mean()),
+        }
+    result["constant_half_pair_mae"] = float((pairs["actual"] - 0.5).abs().mean())
+    return result
+
+
+def evaluate_pct_ns_ranking(
+    test_rows: pl.DataFrame,
+    predicted: pl.Series,
+    line: tuple[float, float],
+) -> dict:
+    intercept, slope = line
+    frame = test_rows.with_columns(predicted.cast(pl.Float64).alias("model_raw")).filter(
+        pl.col("Club").is_not_null()
+    )
+    frame = frame.with_columns(
+        (intercept + slope * pl.col("Elo_Gap").cast(pl.Float64)).clip(0.0, 1.0).alias("elo_line_raw"),
+    )
+    frame = frame.with_columns(
+        center_per_board("model_raw").alias("model_per_board"),
+        center_per_board("elo_line_raw").alias("elo_line_per_board"),
+    )
+    quality = pair_session_rank_quality(
+        frame,
+        ["model_raw", "model_per_board", "elo_line_raw", "elo_line_per_board"],
+    )
+    quality["elo_line"] = {"intercept": intercept, "slope_per_100_elo": slope * 100.0}
+    return quality
 
 
 def _delete_shards(models_dir: Path, model_name: str) -> None:
@@ -233,7 +332,10 @@ def train_one(
     finally:
         _delete_shards(models_dir, model_name)
 
-    evaluation = prepare_target_frame(test_df, target)
+    test_rows = test_df
+    if target == "Pct_NS":
+        test_rows = test_df.filter(pl.col(target).is_not_null() & pl.col(target).is_finite())
+    evaluation = prepare_target_frame(test_rows, target)
     features = evaluation.drop(target)
     predicted = predict_model(
         models_dir,
@@ -251,6 +353,14 @@ def train_one(
             f"Prediction row count {predicted.height:,} != test rows {evaluation.height:,} for {target}"
         )
     metrics = _score(evaluation[target], predicted[pred_column], target)
+    if target == "Pct_NS":
+        if evaluation.height != test_rows.height:
+            raise RuntimeError(
+                f"Pct_NS evaluation rows {evaluation.height:,} != test rows {test_rows.height:,}"
+            )
+        metrics["ranking"] = evaluate_pct_ns_ranking(
+            test_rows, predicted[pred_column], elo_gap_line(train_df)
+        )
     metrics.update(
         {
             "target": target,

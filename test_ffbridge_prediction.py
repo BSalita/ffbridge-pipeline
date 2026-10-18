@@ -174,6 +174,25 @@ class FeatureTests(unittest.TestCase):
         self.assertEqual(picked, ["3NN", "PASS"])
         self.assertEqual(seats, ["N", "NULL"])
 
+    def test_declarer_model_without_a_pass_out_class_is_neutral_on_pass(self):
+        contracts = ["3NN", "3NS", "PASS"]
+        directions = ["E", "N", "S", "W"]
+        # A declarer model with no opinion leaves the contract model's choice.
+        uniform = np.full((2, 4), 0.25)
+        contract_probs = np.array([[0.30, 0.20, 0.50], [0.45, 0.15, 0.40]])
+        picked, seats = features.joint_contract_and_declarer(contracts, contract_probs, directions, uniform)
+        self.assertEqual(picked, ["PASS", "3NN"])
+        self.assertEqual(seats, ["NULL", "N"])
+        # A confident South moves the first board from PASS to 3NS.
+        confident = np.array([[0.0, 0.05, 0.95, 0.0], [0.25, 0.25, 0.25, 0.25]])
+        picked, _ = features.joint_contract_and_declarer(contracts, contract_probs, directions, confident)
+        self.assertEqual(picked, ["3NS", "3NN"])
+        # At zero weight the declarer model has no say.
+        picked, _ = features.joint_contract_and_declarer(
+            contracts, contract_probs, directions, confident, declarer_weight=0.0
+        )
+        self.assertEqual(picked, ["PASS", "3NN"])
+
 
 if __name__ == "__main__":
     unittest.main()

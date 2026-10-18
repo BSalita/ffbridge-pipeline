@@ -1,11 +1,15 @@
+import math
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 
 import ffbridge_prediction_data as data
 import ffbridge_prediction_train as train
+from mlBridge import ffbridge_prediction_features as features
 
 
 class LabelTests(unittest.TestCase):
@@ -111,6 +115,64 @@ class RankingEvaluationTests(unittest.TestCase):
         intercept, slope = train.elo_gap_line(frame)
         self.assertAlmostEqual(intercept, 0.5)
         self.assertAlmostEqual(slope * 100.0, 0.025)
+
+
+class FeatureTests(unittest.TestCase):
+    def test_history_uses_only_days_before_the_session(self):
+        boards = pl.DataFrame(
+            {
+                "Date": [date(2026, 1, 5), date(2026, 1, 5), date(2026, 2, 1)],
+                "session_id": ["1", "1", "2"],
+                "Declarer_Direction": ["N", "W", "S"],
+                "Declarer_Pct": [0.8, 0.6, 0.1],
+                "Player_ID_N": ["10", "10", "10"],
+                "Player_ID_S": ["20", "20", "21"],
+                "Player_ID_E": ["30", "30", "30"],
+                "Player_ID_W": ["40", "40", "40"],
+            }
+        )
+        players, pairs = features.build_history_tables(boards.lazy())
+        sessions = pl.DataFrame(
+            {
+                "Date": [date(2026, 1, 5), date(2026, 2, 1), date(2026, 3, 1)],
+                "N": ["10", "10", "10"],
+                "S": ["20", "21", "20"],
+                "E": ["30", "30", "30"],
+                "W": ["40", "40", "40"],
+            }
+        )
+        out = features.attach_history(sessions, players, pairs, {seat: seat for seat in "NESW"})
+        self.assertEqual(out["Hist_Boards_N"][0], 0.0)
+        self.assertAlmostEqual(out["Hist_Pct_N"][0], 0.5)
+        # Day one: N scored 0.8 and 0.4 (West declared at 0.6).
+        self.assertAlmostEqual(out["Hist_Pct_N"][1], (1.2 + 30.0) / 62.0, places=5)
+        self.assertAlmostEqual(out["Hist_Decl_Pct_N"][1], (0.8 + 7.5) / 16.0, places=5)
+        self.assertAlmostEqual(out["Hist_Def_Pct_N"][1], (0.4 + 15.0) / 31.0, places=5)
+        # 10|21 first played on 2026-02-01, so it has no record that day.
+        self.assertEqual(out["Hist_Partner_Sessions_NS"][1], 0.0)
+        self.assertAlmostEqual(out["Hist_Partner_Sessions_NS"][2], math.log1p(1.0), places=5)
+        self.assertAlmostEqual(out["Hist_Boards_N"][2], math.log1p(3.0), places=5)
+
+    def test_suit_lengths_and_fits_from_pbn(self):
+        frame = pl.DataFrame(
+            {"PBN": ["N:AKQJT.98.765.43 98.765.43.AKQJT2 765.43.AKQJT2.98 432.AKQJT2.98.765"]}
+        )
+        out = features.shape_features(frame).row(0, named=True)
+        self.assertEqual((out["SL_N_S"], out["SL_N_H"], out["SL_N_D"], out["SL_N_C"]), (5.0, 2.0, 3.0, 2.0))
+        self.assertEqual(out["SL_E_C"], 6.0)
+        self.assertEqual(out["Fit_NS_S"], 8.0)
+        self.assertEqual(out["Fit_EW_H"], 9.0)
+
+    def test_joint_pick_keeps_contract_and_declarer_consistent(self):
+        contracts = ["3NE", "3NN", "4SS", "PASS"]
+        directions = ["E", "N", "NULL", "S", "W"]
+        contract_probs = np.array([[0.40, 0.35, 0.20, 0.05], [0.1, 0.1, 0.1, 0.7]])
+        direction_probs = np.array([[0.10, 0.60, 0.05, 0.20, 0.05], [0.3, 0.3, 0.1, 0.2, 0.1]])
+        picked, seats = features.joint_contract_and_declarer(
+            contracts, contract_probs, directions, direction_probs
+        )
+        self.assertEqual(picked, ["3NN", "PASS"])
+        self.assertEqual(seats, ["N", "NULL"])
 
 
 if __name__ == "__main__":

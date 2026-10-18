@@ -376,6 +376,81 @@ def train_one(
     return metrics
 
 
+def schema_classes(models_dir: Path, model_name: str) -> list[str]:
+    schema = json.loads((models_dir / f"{model_name}_schema.json").read_text(encoding="utf-8"))
+    class_to_idx = schema["class_to_idx"]
+    return sorted(class_to_idx, key=class_to_idx.get)
+
+
+JOINT_SAMPLE_ROWS = 300_000
+
+
+def _probs_matrix(series: pl.Series, width: int):
+    return series.list.to_array(width).to_numpy()
+
+
+def evaluate_joint_contract_declarer(test_df: pl.DataFrame, models_dir: Path, device: str) -> dict:
+    """Accuracy of each classifier alone and of one contract chosen from both.
+
+    Scored on a fixed sample: full class probabilities for every test row
+    would not fit in memory.
+    """
+    from mlBridge.ffbridge_prediction_features import joint_contract_and_declarer
+    from mlBridge.mlBridgeAiLib import predict_model
+
+    rows = test_df.filter(pl.col("Contract").is_not_null())
+    if rows.height > JOINT_SAMPLE_ROWS:
+        rows = rows.sample(JOINT_SAMPLE_ROWS, seed=42)
+    evaluation = prepare_target_frame(rows, "Contract")
+    if evaluation.height != rows.height:
+        raise RuntimeError("Contract and declarer test rows do not line up")
+    features = evaluation.drop("Contract")
+    actual_contract = evaluation["Contract"].cast(pl.Utf8)
+    actual_direction = rows["Declarer_Direction"].cast(pl.Utf8)
+    outputs = {}
+    for target in ("Contract", "Declarer_Direction"):
+        name = _model_name(target)
+        predicted = predict_model(
+            models_dir, name, features, device=device, return_probs=True,
+            strict_validation=True, parity_drop_non_finite=False,
+        )
+        outputs[target] = (schema_classes(models_dir, name), predicted)
+    contract_classes, contract_out = outputs["Contract"]
+    direction_classes, direction_out = outputs["Declarer_Direction"]
+    joint_contract, joint_direction = joint_contract_and_declarer(
+        contract_classes,
+        _probs_matrix(contract_out["Contract_Probs"], len(contract_classes)),
+        direction_classes,
+        _probs_matrix(direction_out["Declarer_Direction_Probs"], len(direction_classes)),
+    )
+    alone_contract = contract_out["Contract_Pred"].cast(pl.Utf8)
+    alone_direction = direction_out["Declarer_Direction_Pred"].cast(pl.Utf8)
+    frame = pl.DataFrame(
+        {
+            "contract": actual_contract,
+            "direction": actual_direction,
+            "alone_contract": alone_contract,
+            "alone_direction": alone_direction,
+            "joint_contract": pl.Series(joint_contract, dtype=pl.Utf8),
+            "joint_direction": pl.Series(joint_direction, dtype=pl.Utf8),
+        }
+    ).with_columns(
+        pl.when(pl.col("alone_contract") == "PASS").then(pl.lit("NULL"))
+        .otherwise(pl.col("alone_contract").str.slice(-1)).alias("contract_model_direction")
+    )
+    stats = frame.select(
+        (pl.col("alone_contract") == pl.col("contract")).mean().alias("contract_alone"),
+        (pl.col("joint_contract") == pl.col("contract")).mean().alias("contract_joint"),
+        (pl.col("alone_direction") == pl.col("direction")).mean().alias("direction_alone"),
+        (pl.col("contract_model_direction") == pl.col("direction")).mean().alias("direction_from_contract_model"),
+        (pl.col("joint_direction") == pl.col("direction")).mean().alias("direction_joint"),
+        (pl.col("contract_model_direction") == pl.col("alone_direction")).mean().alias("alone_models_agree"),
+    ).row(0, named=True)
+    result = {"target": "Joint_Contract_Declarer", "rows": frame.height, **stats}
+    print(f"Joint contract/declarer metrics: {result}")
+    return result
+
+
 def working_feature_count(schema: dict) -> int:
     numeric = schema.get("numerical_feature_cols") or []
     categorical = schema.get("categorical_feature_cols") or []
@@ -458,7 +533,12 @@ def main(argv: list[str] | None = None) -> int:
             device=device,
             shard_rows=args.shard_rows,
         )
-    ordered = [by_target[name] for name in TARGETS if name in by_target]
+    classifiers = ("Contract", "Declarer_Direction")
+    if any(name in pending for name in classifiers) and all(
+        (models_dir / f"{_model_name(name)}.pth").is_file() for name in classifiers
+    ):
+        by_target["Joint_Contract_Declarer"] = evaluate_joint_contract_declarer(test_df, models_dir, device)
+    ordered = [by_target[name] for name in (*TARGETS, "Joint_Contract_Declarer") if name in by_target]
     metrics_path.write_text(json.dumps(ordered, indent=2), encoding="utf-8")
     meta_path = args.data_dir / META_NAME
     print(f"Wrote {metrics_path}")

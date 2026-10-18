@@ -7,8 +7,9 @@ pair-session table (``player1_id`` / ``player2_id``, scratch Elo *before* the
 session). Trained ACBL weights cannot be reused. This script is the FFBridge
 counterpart of those two stages:
 
-- join each board to its deal features on PBN
+- join each board to its deal features on PBN, plus suit lengths for all seats
 - build ``Contract`` as ``{level}{strain}{double}{declarer}`` (or ``PASS``)
+- attach each player's and partnership's record from earlier days
 - attach pre-session scratch Elo when a results parquet is available
 - write a temporal train/test split (default cutoff 2026-01-01)
 
@@ -33,12 +34,27 @@ from pathlib import Path
 
 import polars as pl
 
+_REPO_SRC = Path(__file__).resolve().parent.parent
+if str(_REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(_REPO_SRC))
+
+from mlBridge.ffbridge_prediction_features import (  # noqa: E402
+    HISTORY_FEATURES,
+    SHAPE_FEATURES,
+    attach_history,
+    build_history_tables,
+    shape_features,
+)
+
 
 DEFAULT_CLUB_DIR = Path(r"E:\bridge\data\ffbridge")
 DEFAULT_CUTOFF = "2026-01-01"
 TRAIN_NAME = "ffbridge_prediction_data_train.parquet"
 TEST_NAME = "ffbridge_prediction_data_test.parquet"
 META_NAME = "ffbridge_prediction_data_meta.json"
+# Staged with the models: the postmortem looks players up in these.
+PLAYER_HISTORY_NAME = "ffbridge_prediction_player_history.parquet"
+PAIR_HISTORY_NAME = "ffbridge_prediction_pair_history.parquet"
 
 TARGETS = ("Declarer_Direction", "Contract", "Pct_NS")
 
@@ -100,7 +116,9 @@ def feature_columns(frame: pl.DataFrame) -> list[str]:
     numeric = [RENAMES.get(name, name) for name in HAND_NUMERIC]
     present = [
         name
-        for name in (*numeric, *CT_FEATURES, *CATEGORICAL_FEATURES, *ELO_FEATURES)
+        for name in dict.fromkeys(
+            (*numeric, *SHAPE_FEATURES, *CT_FEATURES, *CATEGORICAL_FEATURES, *ELO_FEATURES, *HISTORY_FEATURES)
+        )
         if name in frame.columns
     ]
     return present
@@ -235,9 +253,13 @@ def _join_deals(club_dir: Path, max_rows: int | None, cutoff: date) -> pl.DataFr
         "Player_ID_S",
         "Player_ID_W",
     ]
-    hands = pl.scan_parquet(hands_path).select(["PBN", *HAND_NUMERIC, *CT_FEATURES]).unique(
-        subset=["PBN"], keep="first"
+    hands = (
+        pl.scan_parquet(hands_path)
+        .select(["PBN", *HAND_NUMERIC, *CT_FEATURES])
+        .unique(subset=["PBN"], keep="first")
+        .collect()
     )
+    hands = shape_features(hands).lazy()
     boards = pl.scan_parquet(boards_path).select(board_columns)
     joined = boards.join(hands, on="PBN", how="inner").with_columns(
         *build_labels(), *pair_key_columns()
@@ -362,6 +384,28 @@ def attach_scratch_elo(frame: pl.DataFrame, results_path: Path) -> tuple[pl.Data
     return out.drop("_sid", *player_ids), True
 
 
+def _attach_player_history(club_dir: Path, models_dir: Path, frame: pl.DataFrame) -> pl.DataFrame:
+    """Player and partnership records from boards before each session's date.
+
+    The running-total tables are built from every club board and written to
+    ``models_dir`` so the postmortem can look up the same records.
+    """
+    started = datetime.now()
+    boards = pl.scan_parquet(club_dir / "ffbridge_club_board_results_augmented.parquet")
+    players, pairs = build_history_tables(boards)
+    models_dir.mkdir(parents=True, exist_ok=True)
+    players.write_parquet(models_dir / PLAYER_HISTORY_NAME)
+    pairs.write_parquet(models_dir / PAIR_HISTORY_NAME)
+    print(
+        f"History tables: {players.height:,} player-days, {pairs.height:,} partnership-days "
+        f"({(datetime.now() - started).total_seconds():.0f}s)"
+    )
+    out = attach_history(frame, players, pairs, {seat: f"Player_ID_{seat}" for seat in "NESW"})
+    known = out.select((pl.col("Hist_Boards_N") > 0).mean()).item()
+    print(f"North has earlier boards on {known:.1%} of rows ({(datetime.now() - started).total_seconds():.0f}s)")
+    return out
+
+
 def _ct_code_expr(name: str) -> pl.Expr:
     return (
         pl.col(name)
@@ -375,7 +419,11 @@ def _ct_code_expr(name: str) -> pl.Expr:
 
 def _cast_model_columns(frame: pl.DataFrame) -> pl.DataFrame:
     numeric = [RENAMES.get(name, name) for name in HAND_NUMERIC]
-    numeric = [name for name in (*numeric, *ELO_FEATURES) if name in frame.columns]
+    numeric = [
+        name
+        for name in dict.fromkeys((*numeric, *SHAPE_FEATURES, *ELO_FEATURES, *HISTORY_FEATURES))
+        if name in frame.columns
+    ]
     exprs = [
         pl.col(name).cast(pl.Float32, strict=False).fill_null(0.0).fill_nan(0.0).alias(name)
         for name in numeric
@@ -402,6 +450,7 @@ def build_prediction_data(
     print("[5a] Joining club boards to narrow deal features...")
     frame = _join_deals(club_dir, max_rows, cutoff)
     print(f"Joined rows: {frame.height:,}  columns: {len(frame.columns)}")
+    frame = _attach_player_history(club_dir, output_dir / "SavedModels", frame)
     used_elo = False
     if elo_results is not None:
         print(f"[5a] Attaching pre-session scratch Elo from {elo_results}")
@@ -437,6 +486,7 @@ def build_prediction_data(
         "max_rows": max_rows,
         "contract": "level + strain + double + declarer, or PASS",
         "score_target": "Pct_NS",
+        "history_tables": [PLAYER_HISTORY_NAME, PAIR_HISTORY_NAME],
     }
     (output_dir / META_NAME).write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(

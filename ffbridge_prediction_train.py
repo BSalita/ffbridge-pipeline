@@ -269,11 +269,6 @@ def evaluate_pct_ns_ranking(
     return quality
 
 
-def _delete_shards(models_dir: Path, model_name: str) -> None:
-    for path in models_dir.glob(f"{model_name}_shard_*.pt"):
-        path.unlink(missing_ok=True)
-
-
 def train_one(
     train_df: pl.DataFrame,
     test_df: pl.DataFrame,
@@ -284,14 +279,16 @@ def train_one(
     shard_rows: int,
 ) -> dict:
     import math
+    import time
 
     from mlBridge.mlBridgeAiLib import (
-        create_torch_shards,
+        build_torch_shards,
         generate_and_save_schema,
         predict_model,
         train_model_from_shards,
     )
 
+    started = time.perf_counter()
     hp = _hyperparameters(target)
     model_name = _model_name(target)
     print(f"\n{'=' * 60}\n{model_name}  device={device}  epochs={epochs}  layers={hp['layers']}")
@@ -314,24 +311,25 @@ def train_one(
     rows = working.height
     shard_count = math.ceil(rows / shard_rows) if shard_rows else 0
     effective_shards = shard_rows if shard_count >= 2 else max(1, rows // 2)
-    create_torch_shards(working, schema, shard_rows_count=effective_shards, apply_scaling=True)
+    shards = build_torch_shards(working, schema, shard_rows_count=effective_shards, apply_scaling=True)
     del working
-    try:
-        train_model_from_shards(
-            schema,
-            epochs=epochs,
-            bs=hp["bs"],
-            lr=hp["lr"],
-            weight_decay=hp["weight_decay"],
-            use_amp=device == "cuda",
-            device=device,
-            seed=42,
-            early_stop_patience=3,
-            verbose=True,
-            resident_data=True,
-        )
-    finally:
-        _delete_shards(models_dir, model_name)
+    prepared = time.perf_counter()
+    train_model_from_shards(
+        schema,
+        epochs=epochs,
+        bs=hp["bs"],
+        lr=hp["lr"],
+        weight_decay=hp["weight_decay"],
+        use_amp=device == "cuda",
+        device=device,
+        seed=42,
+        early_stop_patience=3,
+        verbose=True,
+        resident_data=True,
+        shards=shards,
+    )
+    del shards
+    trained = time.perf_counter()
 
     test_rows = test_df
     if target == "Pct_NS":
@@ -374,6 +372,10 @@ def train_one(
         }
     )
     print(f"{target} test metrics: {metrics}")
+    print(
+        f"{target} elapsed: prepare {prepared - started:.1f}s, train {trained - prepared:.1f}s, "
+        f"evaluate {time.perf_counter() - trained:.1f}s"
+    )
     return metrics
 
 
@@ -475,6 +477,17 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         pass
 
+    from datetime import datetime
+
+    started = datetime.now()
+    print(f"[ffbridge-prediction-train] start {started:%Y-%m-%dT%H:%M:%S}")
+    status = _run(args)
+    ended = datetime.now()
+    print(f"[ffbridge-prediction-train] end {ended:%Y-%m-%dT%H:%M:%S} (elapsed {(ended - started).total_seconds():.1f}s)")
+    return status
+
+
+def _run(args: argparse.Namespace) -> int:
     try:
         import torch
     except ImportError as exc:

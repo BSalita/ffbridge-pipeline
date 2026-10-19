@@ -198,17 +198,18 @@ if errorlevel 1 goto :error
 ::         E:\bridge\data\ffbridge\ffbridge_prediction_metrics.json
 ::           (per-target accuracy/MAE, club-rank Spearman per club session
 ::           vs an Elo-gap line, and the joint contract/declarer pick)
-:: TIME:   MEASURED 2026-10-20: 203s for three models (Declarer_Direction,
-::         Contract, Pct_NS) on 7.37M train rows, CUDA (was 270s on
-::         2026-10-19, same weights). Per model: about 9s building shards,
-::         40-60s training, 6-8s test evaluation. Epochs default to 8
-::         with early stopping (20 epochs gave the same best epoch).
+:: TIME:   MEASURED 2026-10-20: 147s for three models
+::         (Declarer_Direction, Contract, Pct_NS) on 7.37M train rows, CUDA
+::         (270s on 2026-10-19). 32,000-row batches, 16 epochs with early
+::         stopping. Per model: about 10s building shards, 20-32s training,
+::         7-9s test evaluation. 8,192-row batches for 8 epochs took 144s of
+::         training and scored 0.7 points lower on both classifiers.
 ::         --if-stale skips a target whose .pth is newer than the train parquet.
 ::         Shards are built in memory and moved to the GPU once per target;
 ::         no shard files are written.
-:: ACCURACY 2026 test (2.22M boards): Declarer_Direction 0.6575 (joint 0.6630),
-::         Contract 0.3835 (joint 0.3864), Pct_NS MAE 0.2316, club-rank
-::         Spearman 0.532 vs Elo line 0.512 (10,630 club sessions).
+:: ACCURACY 2026 test (2.43M boards): Declarer_Direction 0.6619 (joint 0.6647),
+::         Contract 0.3871 (joint 0.3887), Pct_NS MAE 0.2316, club-rank
+::         Spearman 0.529 vs Elo line 0.511 (12,105 club sessions).
 :: PUBLISH: ..\elo\u.bat (run by ..\u_all.bat) copies SavedModels to src\data
 ::         and X1; restart the postmortem container to stage them.
 echo   [5c] Training prediction models...

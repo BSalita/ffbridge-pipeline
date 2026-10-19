@@ -71,30 +71,33 @@ def _model_name(target: str) -> str:
 
 def _hyperparameters(target: str) -> dict:
     # Narrow inputs. ACBL's 2048-wide nets are sized for ~6,000 columns.
+    # 32,000-row batches with twice the 8,192-row learning rates and 16 epochs:
+    # 2026-10-20 benchmark, 96s vs 144s training, both classifiers +0.7 points,
+    # Pct_NS MAE and club-rank Spearman unchanged.
     if target == "Declarer_Direction":
         return {
             "layers": [512, 256, 128],
             "dropout": 0.10,
-            "lr": 1e-3,
+            "lr": 2e-3,
             "weight_decay": 0.0,
-            "bs": 8192,
+            "bs": 32000,
             "y_range": None,
         }
     if target == "Contract":
         return {
             "layers": [512, 256, 128],
             "dropout": 0.20,
-            "lr": 3e-4,
+            "lr": 6e-4,
             "weight_decay": 0.0,
-            "bs": 8192,
+            "bs": 32000,
             "y_range": None,
         }
     return {
         "layers": [256, 128, 64],
         "dropout": 0.05,
-        "lr": 3e-4,
+        "lr": 6e-4,
         "weight_decay": 1e-4,
-        "bs": 8192,
+        "bs": 32000,
         "y_range": None,
     }
 
@@ -465,7 +468,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--data-dir", type=Path, default=Path(r"E:\bridge\data\ffbridge"))
     parser.add_argument("--models-dir", type=Path, default=None)
     parser.add_argument("--target", action="append", choices=TARGETS, dest="targets")
-    parser.add_argument("--epochs", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=16)
     parser.add_argument("--shard-rows", type=int, default=500_000)
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--if-stale", action="store_true")

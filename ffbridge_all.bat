@@ -67,11 +67,23 @@ call :now PIPE_T0
 echo [Stage 1] Refresh quality cache...
 :: READS:  E:\bridge\data\ffbridge\data  (raw Lancelot / team scores)
 :: WRITES: E:\bridge\data\ffbridge\quality_cache\ffbridge_quality_*.parquet
+::         E:\bridge\data\ffbridge\club_session_fragments\  (Club fragments for stage 2)
+::         E:\bridge\data\ffbridge\ffbridge_cache_audit.json  (complete sessions)
+::         E:\bridge\data\ffbridge\ffbridge_identity_map.json  (Lancelot-to-Elo aliases)
 ::         ..\elo\data\ffbridge\quality_cache\  (copy for the Elo app)
 :: TIME:   --if-stale skips a full rebuild when today's cache is fresh.
+::         The audit reuses ffbridge_cache_audit.json and runs again only when
+::         the fetch wrote files. Sessions the last build found unusable are
+::         not reloaded (--retry-unsupported retries them). New sessions go in
+::         chunks of 128: every new deal is solved once (batched ddss DD, Par,
+::         SD split across workers), the hand-records cache is saved once per
+::         chunk, then FFBRIDGE_QUALITY_WORKERS processes (default 16) augment
+::         the sessions and write quality and Club fragments in one pass.
 ::         Cold historical rebuild is hours (8k+ sessions). Incremental: minutes.
+set "QUALITY_WORKERS=16"
+if defined FFBRIDGE_QUALITY_WORKERS set "QUALITY_WORKERS=%FFBRIDGE_QUALITY_WORKERS%"
 if not exist "%QUALITY_OUT%\" mkdir "%QUALITY_OUT%"
-call :pyrun 1a "%ELO_PY%" "%ELO%\build_ffbridge_quality_parquets.py" --source-dir "%SOURCE%" --output-dir "%QUALITY_OUT%" --if-stale
+call :pyrun 1a "%ELO_PY%" "%ELO%\build_ffbridge_quality_parquets.py" --source-dir "%SOURCE%" --output-dir "%QUALITY_OUT%" --club-output-dir "%CLUB_OUT%" --workers %QUALITY_WORKERS% --if-stale
 if errorlevel 1 goto :error
 
 echo   [1b] Copying quality sidecars into ..\elo\data ...
@@ -104,16 +116,19 @@ echo [Stage 2] Building Club BridgeStats parquets...
 ::         E:\bridge\data\ffbridge\ffbridge_club_hand_records_augmented_narrow.parquet
 ::         E:\bridge\data\ffbridge\ffbridge_player_info.parquet
 ::         E:\bridge\data\ffbridge\ffbridge_clubs.parquet
-:: TIME:   maps complete cached sessions into slim club_session_fragments.
-::         Uses Lancelot's embedded DD table (no per-session DDS/SD redo).
-::         Reruns resume finished session fragments. Use FFBRIDGE_SESSION_LIMIT
-::         to bound a smoke test. FFBRIDGE_CLUB_WORKERS defaults to 8.
+:: TIME:   stage 1 already wrote club_session_fragments for every session it
+::         augmented, so this step mostly concatenates fragments. It augments
+::         only sessions with no current fragment (e.g. ones in the training
+::         parquet). --if-stale skips the rewrite when the candidate sessions
+::         and their fragments are unchanged since the last build
+::         (ffbridge_club_manifest.json). Use FFBRIDGE_SESSION_LIMIT to bound
+::         a smoke test. FFBRIDGE_CLUB_WORKERS defaults to 8.
 set "LIMIT_ARGS="
 if defined FFBRIDGE_SESSION_LIMIT set "LIMIT_ARGS=--session-limit %FFBRIDGE_SESSION_LIMIT%"
 set "WORKER_ARGS=--workers 8"
 if defined FFBRIDGE_CLUB_WORKERS set "WORKER_ARGS=--workers %FFBRIDGE_CLUB_WORKERS%"
 if not exist "%CLUB_OUT%\" mkdir "%CLUB_OUT%"
-call :pyrun 2 "%CLUB_PY%" "%STATS%\build_ffbridge_club_parquets.py" --from-quality-cache --source-dir "%SOURCE%" --output-dir "%CLUB_OUT%" %LIMIT_ARGS% %WORKER_ARGS%
+call :pyrun 2 "%CLUB_PY%" "%STATS%\build_ffbridge_club_parquets.py" --from-quality-cache --source-dir "%SOURCE%" --output-dir "%CLUB_OUT%" %LIMIT_ARGS% %WORKER_ARGS% --if-stale
 if errorlevel 1 goto :error
 
 :: ====================================================================
@@ -187,7 +202,10 @@ if errorlevel 1 goto :error
 ::         Contract, Pct_NS) on 7.37M train rows, CUDA. Epochs default to 8
 ::         with early stopping (20 epochs gave the same best epoch).
 ::         --if-stale skips a target whose .pth is newer than the train parquet.
-::         Shard files are removed after each target.
+::         Shards are loaded onto the GPU once per target (not re-read every
+::         epoch) and losses accumulate on the GPU; same weights, epochs about
+::         25-30% faster in a 3M-row benchmark. Shard files are removed after
+::         each target.
 :: ACCURACY 2026 test (2.22M boards): Declarer_Direction 0.6575 (joint 0.6630),
 ::         Contract 0.3835 (joint 0.3864), Pct_NS MAE 0.2316, club-rank
 ::         Spearman 0.532 vs Elo line 0.512 (10,630 club sessions).
@@ -232,15 +250,24 @@ del /q "%STEP_OK%" 2>nul
 goto :eof
 
 :: usage: call :pyrun LABEL python.exe script.py [args...]
-:: Use %~1 after shift. "%1" double-quotes the already-quoted exe path,
+:: Use %~2 for the exe. "%2" double-quotes the already-quoted exe path,
 :: and cmd then hands python.exe to another interpreter as a script.
+:: Arguments are collected with shift: %10 and up do not exist in cmd.
 :pyrun
 set "STEP_LABEL=%~1"
+set "PYEXE=%~2"
+set "PYARGS="
 shift
-set "PYEXE=%~1"
+shift
+:pyrun_args
+if "%~1"=="" goto :pyrun_go
+set PYARGS=%PYARGS% %1
+shift
+goto :pyrun_args
+:pyrun_go
 del /q "%STEP_OK%" 2>nul
 call :now STEP_T0
-"%PYEXE%" %2 %3 %4 %5 %6 %7 %8 %9 && echo.>"%STEP_OK%"
+"%PYEXE%" %PYARGS% && echo.>"%STEP_OK%"
 if not exist "%STEP_OK%" exit /b 1
 call :toc %STEP_LABEL%
 exit /b 0

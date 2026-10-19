@@ -328,6 +328,7 @@ def train_one(
             seed=42,
             early_stop_patience=3,
             verbose=True,
+            resident_data=True,
         )
     finally:
         _delete_shards(models_dir, model_name)

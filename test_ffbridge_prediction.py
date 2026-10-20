@@ -166,7 +166,7 @@ class FeatureTests(unittest.TestCase):
     def test_joint_pick_keeps_contract_and_declarer_consistent(self):
         contracts = ["3NE", "3NN", "4SS", "PASS"]
         directions = ["E", "N", "NULL", "S", "W"]
-        contract_probs = np.array([[0.40, 0.35, 0.20, 0.05], [0.1, 0.1, 0.1, 0.7]])
+        contract_probs = np.array([[0.40, 0.35, 0.20, 0.05], [0.05, 0.05, 0.05, 0.85]])
         direction_probs = np.array([[0.10, 0.60, 0.05, 0.20, 0.05], [0.3, 0.3, 0.1, 0.2, 0.1]])
         picked, seats = features.joint_contract_and_declarer(
             contracts, contract_probs, directions, direction_probs
@@ -179,7 +179,7 @@ class FeatureTests(unittest.TestCase):
         directions = ["E", "N", "S", "W"]
         # A declarer model with no opinion leaves the contract model's choice.
         uniform = np.full((2, 4), 0.25)
-        contract_probs = np.array([[0.30, 0.20, 0.50], [0.45, 0.15, 0.40]])
+        contract_probs = np.array([[0.25, 0.20, 0.55], [0.45, 0.15, 0.40]])
         picked, seats = features.joint_contract_and_declarer(contracts, contract_probs, directions, uniform)
         self.assertEqual(picked, ["PASS", "3NN"])
         self.assertEqual(seats, ["NULL", "N"])
@@ -192,6 +192,20 @@ class FeatureTests(unittest.TestCase):
             contracts, contract_probs, directions, confident, declarer_weight=0.0
         )
         self.assertEqual(picked, ["PASS", "3NN"])
+
+    def test_part_score_spread_over_classes_beats_one_game_class(self):
+        contracts = ["2HN", "2HS", "2SN", "4SN", "PASS"]
+        directions = ["E", "N", "S", "W"]
+        uniform = np.full((2, 4), 0.25)
+        # 4SN, then PASS, is the single likeliest class, but part-scores hold 60% and 50%.
+        contract_probs = np.array([[0.20, 0.15, 0.25, 0.38, 0.02], [0.18, 0.12, 0.20, 0.10, 0.40]])
+        picked, seats = features.joint_contract_and_declarer(contracts, contract_probs, directions, uniform)
+        self.assertEqual(picked, ["2SN", "2SN"])
+        self.assertEqual(seats, ["N", "N"])
+        self.assertEqual(
+            [features.contract_bucket(c) for c in ("PASS", "4CN", "3NS", "4HE", "5DW", "5SN", "6CN", "7NS")],
+            [0, 1, 2, 2, 2, 2, 3, 3],
+        )
 
 
 if __name__ == "__main__":

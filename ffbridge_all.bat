@@ -161,15 +161,19 @@ echo [Stage 4] Building the postmortem archive...
 ::         E:\bridge\data\ffbridge\postmortem_archive_hierarchical\
 ::           (fragments and manifest.parquet; metadata.json is its own
 ::           layout seed, so the column layout never changes here)
-:: TIME:   augments only sessions missing from either archive, then
-::         compacts the affected partitions. FFBRIDGE_ARCHIVE_WORKERS
-::         defaults to 8.
+:: TIME:   augments only sessions on or after FFBRIDGE_ARCHIVE_SINCE
+::         (default 2026-01-01) missing from either archive, about 3 min
+::         per session per worker. FFBRIDGE_ARCHIVE_WORKERS defaults to 8.
+::         Compaction is skipped: u.bat publishes only the manifest and
+::         fragments, and compaction needs tens of GB of RAM.
 :: PUBLISH: ..\elo\u.bat copies the hierarchical archive to src\data and X1.
 ::         It keeps sessions the live service added since the last build.
 set "PM=%SRC%\postmortem-ffbridge"
 set "HIER=%CLUB_OUT%\postmortem_archive_hierarchical"
 set "ARCHIVE_WORKERS=8"
 if defined FFBRIDGE_ARCHIVE_WORKERS set "ARCHIVE_WORKERS=%FFBRIDGE_ARCHIVE_WORKERS%"
+set "ARCHIVE_SINCE=2026-01-01"
+if defined FFBRIDGE_ARCHIVE_SINCE set "ARCHIVE_SINCE=%FFBRIDGE_ARCHIVE_SINCE%"
 if not exist "%HIER%\metadata.json" (
     echo *** FAILED: hierarchical archive layout not found: %HIER%\metadata.json
     set "STEP_LABEL=4"
@@ -177,7 +181,7 @@ if not exist "%HIER%\metadata.json" (
 )
 set "PYTHONPATH_SAVED=%PYTHONPATH%"
 set "PYTHONPATH=%SRC%"
-call :pyrun 4 "%ELO_PY%" "%PM%\build_ffbridge_postmortem_archive.py" --source-dir "%SOURCE%" --archive-dir "%CLUB_OUT%\postmortem_archive_flat" --hierarchical-dir "%HIER%" --hierarchical-layout-seed "%HIER%\metadata.json" --workers %ARCHIVE_WORKERS%
+call :pyrun 4 "%ELO_PY%" "%PM%\build_ffbridge_postmortem_archive.py" --source-dir "%SOURCE%" --archive-dir "%CLUB_OUT%\postmortem_archive_flat" --hierarchical-dir "%HIER%" --hierarchical-layout-seed "%HIER%\metadata.json" --workers %ARCHIVE_WORKERS% --since %ARCHIVE_SINCE% --skip-compact
 set "STEP_EXIT=%ERRORLEVEL%"
 set "PYTHONPATH=%PYTHONPATH_SAVED%"
 if not "%STEP_EXIT%"=="0" goto :error

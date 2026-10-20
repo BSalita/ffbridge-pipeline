@@ -7,6 +7,7 @@ setlocal EnableExtensions
 :: Produces data files consumed by:
 ::   ..\bridgestats-ffbridge  (Club board-results / hand-records / lookups)
 ::   ..\elo                   (quality sidecars, after stage 1 copy)
+::   E:\bridge\data\ffbridge\postmortem_archive_*  (stage 4 postmortem sessions)
 ::   E:\bridge\data\ffbridge\SavedModels  (stage 5 checkpoints and history tables)
 ::
 :: Writes Club parquets to E:\bridge\data\ffbridge. bridgestats-ffbridge\u.bat
@@ -151,6 +152,37 @@ if not "%U_EXIT%"=="0" (
 )
 
 :: ====================================================================
+:: STAGE 4: POSTMORTEM ARCHIVE -- sessions the FFBridge postmortem serves
+:: ====================================================================
+echo.
+echo [Stage 4] Building the postmortem archive...
+:: READS:  E:\bridge\data\ffbridge\data  (raw Lancelot ranking/team JSON)
+:: WRITES: E:\bridge\data\ffbridge\postmortem_archive_flat\
+::         E:\bridge\data\ffbridge\postmortem_archive_hierarchical\
+::           (fragments and manifest.parquet; metadata.json is its own
+::           layout seed, so the column layout never changes here)
+:: TIME:   augments only sessions missing from either archive, then
+::         compacts the affected partitions. FFBRIDGE_ARCHIVE_WORKERS
+::         defaults to 8.
+:: PUBLISH: ..\elo\u.bat copies the hierarchical archive to src\data and X1.
+::         It keeps sessions the live service added since the last build.
+set "PM=%SRC%\postmortem-ffbridge"
+set "HIER=%CLUB_OUT%\postmortem_archive_hierarchical"
+set "ARCHIVE_WORKERS=8"
+if defined FFBRIDGE_ARCHIVE_WORKERS set "ARCHIVE_WORKERS=%FFBRIDGE_ARCHIVE_WORKERS%"
+if not exist "%HIER%\metadata.json" (
+    echo *** FAILED: hierarchical archive layout not found: %HIER%\metadata.json
+    set "STEP_LABEL=4"
+    goto :error
+)
+set "PYTHONPATH_SAVED=%PYTHONPATH%"
+set "PYTHONPATH=%SRC%"
+call :pyrun 4 "%ELO_PY%" "%PM%\build_ffbridge_postmortem_archive.py" --source-dir "%SOURCE%" --archive-dir "%CLUB_OUT%\postmortem_archive_flat" --hierarchical-dir "%HIER%" --hierarchical-layout-seed "%HIER%\metadata.json" --workers %ARCHIVE_WORKERS%
+set "STEP_EXIT=%ERRORLEVEL%"
+set "PYTHONPATH=%PYTHONPATH_SAVED%"
+if not "%STEP_EXIT%"=="0" goto :error
+
+:: ====================================================================
 :: STAGE 5: PREDICTION MODELS
 :: ACBL 5a/5b build a ~6,000-column matrix and join ACBL seat Elo.
 :: FFBridge Club files are the narrow deal matrix, so 5a and 5b are one
@@ -239,6 +271,9 @@ echo  ..\elo:
 echo    ffbridge_quality_boards.parquet
 echo    ffbridge_quality_players.parquet
 echo    ffbridge_quality_pairs.parquet
+echo.
+echo  Postmortem archive (published by ..\elo\u.bat):
+echo    postmortem_archive_hierarchical\manifest.parquet, metadata.json, fragments\
 echo.
 echo  SavedModels (published by ..\elo\u.bat):
 echo    ffbridge_club_predicted_declarer_direction_torch_model.pth

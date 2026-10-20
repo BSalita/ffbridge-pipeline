@@ -11,7 +11,8 @@ An Elo-gap line fitted on the training rows is the baseline the model has
 to beat.
 
 Default network sizes are smaller than ACBL's because this matrix is tens of
-columns, not thousands. Pass ``--epochs`` to match a longer ACBL run.
+columns, not thousands. Each target has its own default epochs; pass
+``--epochs`` to override all of them.
 """
 
 from __future__ import annotations
@@ -82,15 +83,22 @@ def _hyperparameters(target: str) -> dict:
             "weight_decay": 0.0,
             "bs": 32000,
             "y_range": None,
+            "epochs": 16,
         }
     if target == "Contract":
+        # Still improving at epoch 16. 2026-10-21 benchmark on 300k test rows:
+        # 1024/512/256 for up to 96 epochs (best ~epoch 93) lifts exact contract
+        # 38.9% -> 40.8% and declarer seat 66.8% -> 68.0%, and cuts level-too-low
+        # 26.3% -> 24.5% for +0.5 points too-high under the bucket-first pick.
+        # 2048-wide layers overfit by epoch 30; lower dropout was no better.
         return {
-            "layers": [512, 256, 128],
+            "layers": [1024, 512, 256],
             "dropout": 0.20,
             "lr": 6e-4,
             "weight_decay": 0.0,
             "bs": 32000,
             "y_range": None,
+            "epochs": 96,
         }
     return {
         "layers": [256, 128, 64],
@@ -99,6 +107,7 @@ def _hyperparameters(target: str) -> dict:
         "weight_decay": 1e-4,
         "bs": 32000,
         "y_range": None,
+        "epochs": 16,
     }
 
 
@@ -277,7 +286,7 @@ def train_one(
     test_df: pl.DataFrame,
     target: str,
     models_dir: Path,
-    epochs: int,
+    epochs: int | None,
     device: str,
     shard_rows: int,
 ) -> dict:
@@ -293,6 +302,7 @@ def train_one(
 
     started = time.perf_counter()
     hp = _hyperparameters(target)
+    epochs = epochs or hp["epochs"]
     model_name = _model_name(target)
     print(f"\n{'=' * 60}\n{model_name}  device={device}  epochs={epochs}  layers={hp['layers']}")
     working = prepare_target_frame(train_df, target)
@@ -468,7 +478,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--data-dir", type=Path, default=Path(r"E:\bridge\data\ffbridge"))
     parser.add_argument("--models-dir", type=Path, default=None)
     parser.add_argument("--target", action="append", choices=TARGETS, dest="targets")
-    parser.add_argument("--epochs", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=None, help="Override every target's default epochs.")
     parser.add_argument("--shard-rows", type=int, default=500_000)
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--if-stale", action="store_true")

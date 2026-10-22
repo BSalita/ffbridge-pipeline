@@ -261,7 +261,7 @@ def _join_deals(club_dir: Path, max_rows: int | None, cutoff: date) -> pl.DataFr
     )
     hands = shape_features(hands).lazy()
     boards = pl.scan_parquet(boards_path).select(board_columns)
-    joined = boards.join(hands, on="PBN", how="inner").with_columns(
+    joined = boards.join(hands, on="PBN", how="inner", maintain_order="left").with_columns(
         *build_labels(), *pair_key_columns()
     )
     joined = joined.drop("BidLvl", "BidSuit", "Dbl", "Declarer_Pct")

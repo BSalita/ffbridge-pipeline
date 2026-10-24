@@ -157,13 +157,20 @@ if not "%U_EXIT%"=="0" (
 echo.
 echo [Stage 4] Building the postmortem archive...
 :: READS:  E:\bridge\data\ffbridge\data  (raw Lancelot ranking/team JSON)
+::         E:\bridge\data\ffbridge\ffbridge_cache_audit.json from stage 1, so
+::         sessions known complete are not re-audited.
 :: WRITES: E:\bridge\data\ffbridge\postmortem_archive_flat\
 ::         E:\bridge\data\ffbridge\postmortem_archive_hierarchical\
 ::           (fragments and manifest.parquet; metadata.json is its own
 ::           layout seed, so the column layout never changes here)
 :: TIME:   augments only sessions on or after FFBRIDGE_ARCHIVE_SINCE
-::         (default 2026-01-01) missing from either archive, about 3 min
-::         per session per worker. FFBRIDGE_ARCHIVE_WORKERS defaults to 8.
+::         (default 2026-01-01) missing from either archive.
+::         MEASURED 2026-10-24: 8-9.5s augment per session (was 200-400s,
+::         almost all in identify_best_contracts_by_ev). Deals are solved
+::         fresh, not read from stage 1's hand-records cache: that cache's
+::         ParNumber counts contracts differently.
+::         FFBRIDGE_ARCHIVE_WORKERS defaults to 8; each worker gets
+::         cores/workers ddss threads (DDSS_MAX_THREADS).
 ::         Compaction is skipped: u.bat publishes only the manifest and
 ::         fragments, and compaction needs tens of GB of RAM.
 :: PUBLISH: ..\elo\u.bat copies the hierarchical archive to src\data and X1.

@@ -116,6 +116,16 @@ class StalenessTests(unittest.TestCase):
         self.assertNotEqual(data.frame_content_hash(frame.with_columns(pl.col("a").cast(pl.Int32))), same)
         self.assertNotEqual(data.frame_content_hash(frame.with_columns(pl.lit(9).alias("a"))), same)
 
+    def test_hash_ignores_float_noise_but_not_real_changes(self):
+        frame = pl.DataFrame({"x": [0.0, 0.25, 1.0], "y": pl.Series([0.5, 0.0, 2.0], dtype=pl.Float32)})
+        base = data.frame_content_hash(frame)
+        noisy = frame.with_columns(pl.Series("x", [-1.1102230246251565e-16, 0.25 + 1e-15, 1.0]))
+        self.assertEqual(data.frame_content_hash(noisy), base)
+        negative_zero = frame.with_columns(pl.Series("y", [0.5, -0.0, 2.0], dtype=pl.Float32))
+        self.assertEqual(data.frame_content_hash(negative_zero), base)
+        changed = frame.with_columns(pl.Series("x", [0.0, 0.25 + 1e-6, 1.0]))
+        self.assertNotEqual(data.frame_content_hash(changed), base)
+
     def test_data_outputs_stay_fresh_when_only_the_train_file_is_old(self):
         import os
         import time

@@ -162,16 +162,30 @@ def find_elo_results(explicit: str | None) -> Path | None:
     return max(found, key=lambda path: path.stat().st_mtime)
 
 
+# Floats are rounded to this many decimals before hashing. Polars 2 sums
+# group_by aggregates in a varying order, so history features can differ in
+# the last bit between builds of the same data (seen: 21 of 7.4M
+# Hist_Pct_Gap values at 1e-16). That noise must not force a retrain.
+HASH_FLOAT_DECIMALS = 9
+
+
 def frame_content_hash(frame: pl.DataFrame) -> str:
     """SHA-256 of the column layout and every row, in order.
 
-    Row order is included: the trainer does not shuffle, so a reordered
-    frame trains a different model. ``hash_rows`` is stable within one
-    Polars version; an upgrade changes the hash and causes one retrain.
+    Row order is included: the trainer's seeded shuffle permutes row
+    positions, so a reordered frame trains a different model. Float columns
+    are rounded to ``HASH_FLOAT_DECIMALS`` and -0.0 becomes 0.0 first.
+    ``hash_rows`` is stable within one Polars version; an upgrade changes the
+    hash and causes one retrain.
     """
+    canonical = frame.with_columns(
+        (pl.col(name).round(HASH_FLOAT_DECIMALS) + 0.0).alias(name)
+        for name, dtype in frame.schema.items()
+        if dtype.is_float()
+    )
     digest = hashlib.sha256()
     digest.update(json.dumps([[name, str(dtype)] for name, dtype in frame.schema.items()]).encode())
-    digest.update(frame.hash_rows(seed=0).to_numpy().tobytes())
+    digest.update(canonical.hash_rows(seed=0).to_numpy().tobytes())
     return digest.hexdigest()
 
 
@@ -502,7 +516,8 @@ def build_prediction_data(
     test_path = output_dir / TEST_NAME
     meta_path = output_dir / META_NAME
     train_hash = frame_content_hash(train)
-    if train_path.is_file() and previous_train_hash(meta_path) == train_hash:
+    train_kept = train_path.is_file() and previous_train_hash(meta_path) == train_hash
+    if train_kept:
         print(f"Train rows unchanged (hash {train_hash[:12]}); keeping {train_path.name}.")
     else:
         train.write_parquet(train_path)
@@ -524,8 +539,8 @@ def build_prediction_data(
     }
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(
-        f"Wrote {train_path.name} ({train.height:,} rows) and "
-        f"{test_path.name} ({test.height:,} rows), {len(features)} features."
+        f"{'Kept' if train_kept else 'Wrote'} {train_path.name} ({train.height:,} rows); "
+        f"wrote {test_path.name} ({test.height:,} rows), {len(features)} features."
     )
 
 

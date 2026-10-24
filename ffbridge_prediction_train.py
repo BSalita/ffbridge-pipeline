@@ -159,11 +159,46 @@ def prepare_target_frame(frame: pl.DataFrame, target: str) -> pl.DataFrame:
     return out
 
 
-def _fresh_model(models_dir: Path, target: str, train_path: Path) -> bool:
-    checkpoint = models_dir / f"{_model_name(target)}.pth"
-    if not checkpoint.is_file():
+TRAIN_HASHES_NAME = "ffbridge_prediction_model_train_hashes.json"
+
+
+def _current_train_hash(data_dir: Path) -> str | None:
+    """Content hash of the train parquet, written by ffbridge_prediction_data.py."""
+    meta_path = data_dir / META_NAME
+    if not meta_path.is_file():
+        return None
+    return json.loads(meta_path.read_text(encoding="utf-8")).get("train_hash")
+
+
+def _load_train_hashes(data_dir: Path) -> dict[str, str]:
+    path = data_dir / TRAIN_HASHES_NAME
+    if not path.is_file():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _save_train_hashes(data_dir: Path, hashes: dict[str, str]) -> None:
+    path = data_dir / TRAIN_HASHES_NAME
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(hashes, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _checkpoint_key(models_dir: Path, target: str) -> str:
+    """Hashes are kept outside SavedModels (u.bat publishes that folder), keyed
+    by checkpoint path so another --models-dir never matches."""
+    return str((models_dir / f"{_model_name(target)}.pth").resolve())
+
+
+def _fresh_model(
+    models_dir: Path, target: str, train_hash: str | None, trained_hashes: dict[str, str]
+) -> bool:
+    """A model is fresh when it was trained on train rows with this content hash."""
+    if train_hash is None:
         return False
-    return checkpoint.stat().st_mtime >= train_path.stat().st_mtime
+    if not (models_dir / f"{_model_name(target)}.pth").is_file():
+        return False
+    return trained_hashes.get(_checkpoint_key(models_dir, target)) == train_hash
 
 
 def _score(actual: pl.Series, predicted: pl.Series, target: str) -> dict:
@@ -526,10 +561,12 @@ def _run(args: argparse.Namespace) -> int:
     models_dir.mkdir(parents=True, exist_ok=True)
     targets = list(args.targets) if args.targets else list(TARGETS)
 
+    train_hash = _current_train_hash(args.data_dir)
+    trained_hashes = _load_train_hashes(args.data_dir)
     pending = []
     for target in targets:
-        if args.if_stale and _fresh_model(models_dir, target, train_path):
-            print(f"Keeping {_model_name(target)}.pth; it is newer than {train_path.name}.")
+        if args.if_stale and _fresh_model(models_dir, target, train_hash, trained_hashes):
+            print(f"Keeping {_model_name(target)}.pth; train rows are unchanged since it was trained.")
             continue
         pending.append(target)
     if not pending:
@@ -560,6 +597,14 @@ def _run(args: argparse.Namespace) -> int:
             device=device,
             shard_rows=args.shard_rows,
         )
+        # Saved after each model, so an interrupted run keeps what finished.
+        # A run with --epochs is not a default model; leave it marked stale.
+        key = _checkpoint_key(models_dir, target)
+        if train_hash is not None and args.epochs is None:
+            trained_hashes[key] = train_hash
+        else:
+            trained_hashes.pop(key, None)
+        _save_train_hashes(args.data_dir, trained_hashes)
     classifiers = ("Contract", "Declarer_Direction")
     if any(name in pending for name in classifiers) and all(
         (models_dir / f"{_model_name(name)}.pth").is_file() for name in classifiers

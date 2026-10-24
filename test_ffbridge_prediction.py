@@ -64,9 +64,10 @@ class EloTests(unittest.TestCase):
                     "Player_ID_S": ["2"] * 19 + ["98"],
                     "Player_ID_E": ["3"] * 20,
                     "Player_ID_W": ["4"] * 20,
+                    "Date": [date(2025, 6, 1)] * 20,
                 }
             )
-            out, used = data.attach_scratch_elo(boards, path)
+            out, used = data.attach_scratch_elo(boards, path, date(2026, 1, 1))
         self.assertTrue(used)
         self.assertEqual(out["Elo_NS_Missing"].to_list(), [0.0] * 19 + [1.0])
         self.assertEqual(out["Elo_EW_Missing"].to_list(), [0.0] * 20)
@@ -75,6 +76,74 @@ class EloTests(unittest.TestCase):
         self.assertAlmostEqual(out["Elo_NS"][19], 1600.0)
         self.assertAlmostEqual(out["Elo_Gap"][0], 300.0)
         self.assertEqual(out["Club"].to_list(), ["c1"] * 20)
+
+    def test_missing_ratings_are_filled_from_training_rows_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "elo.results.parquet"
+            pl.DataFrame(
+                {
+                    "tournament_id": ["old", "new"],
+                    "player1_id": ["1", "1"],
+                    "player2_id": ["2", "2"],
+                    "player1_scratch_elo_before": [1400.0, 2000.0],
+                    "player2_scratch_elo_before": [1400.0, 2000.0],
+                    "club_id": ["c", "c"],
+                }
+            ).write_parquet(path)
+            # Row 3 (train) has no NS rating; test row 2 must not move its fill.
+            boards = pl.DataFrame(
+                {
+                    "session_id": ["old", "new", "old"],
+                    "Club": [None] * 3,
+                    "Player_ID_N": ["1", "1", "99"],
+                    "Player_ID_S": ["2", "2", "98"],
+                    "Player_ID_E": ["1", "1", "1"],
+                    "Player_ID_W": ["2", "2", "2"],
+                    "Date": [date(2025, 6, 1), date(2026, 3, 1), date(2025, 6, 1)],
+                }
+            )
+            out, _ = data.attach_scratch_elo(boards, path, date(2026, 1, 1))
+        self.assertAlmostEqual(out["Elo_NS"][2], 1400.0)
+        self.assertAlmostEqual(out["Elo_N"][2], 1400.0)
+
+
+class StalenessTests(unittest.TestCase):
+    def test_hash_ignores_nothing_but_identity(self):
+        frame = pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+        same = data.frame_content_hash(frame.clone())
+        self.assertEqual(data.frame_content_hash(frame), same)
+        self.assertNotEqual(data.frame_content_hash(frame.reverse()), same)
+        self.assertNotEqual(data.frame_content_hash(frame.with_columns(pl.col("a").cast(pl.Int32))), same)
+        self.assertNotEqual(data.frame_content_hash(frame.with_columns(pl.lit(9).alias("a"))), same)
+
+    def test_data_outputs_stay_fresh_when_only_the_train_file_is_old(self):
+        import os
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            source = out / "boards.parquet"
+            for name in (data.TRAIN_NAME, data.TEST_NAME, data.META_NAME):
+                (out / name).write_text("x")
+            old = time.time() - 3600
+            os.utime(out / data.TRAIN_NAME, (old, old))
+            source.write_text("x")
+            os.utime(source, (old + 60, old + 60))
+            self.assertTrue(data._outputs_are_fresh(out, [source]))
+            (out / data.META_NAME).unlink()
+            self.assertFalse(data._outputs_are_fresh(out, [source]))
+
+    def test_model_is_fresh_only_for_the_train_hash_it_was_trained_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            models = Path(tmp)
+            target = "Pct_NS"
+            hashes = {train._checkpoint_key(models, target): "abc"}
+            self.assertFalse(train._fresh_model(models, target, "abc", hashes))  # no .pth
+            (models / f"{train._model_name(target)}.pth").write_text("x")
+            self.assertTrue(train._fresh_model(models, target, "abc", hashes))
+            self.assertFalse(train._fresh_model(models, target, "def", hashes))
+            self.assertFalse(train._fresh_model(models, target, None, hashes))
+            self.assertFalse(train._fresh_model(models, "Contract", "abc", hashes))
 
 
 class RankingEvaluationTests(unittest.TestCase):

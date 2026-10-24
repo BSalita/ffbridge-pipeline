@@ -228,8 +228,11 @@ if not exist "%ACBL_PY%" (
 ::           players up in these, so they ship with the checkpoints)
 :: TIME:   MEASURED 2026-10-18: 43s for 9.59M boards (history tables 4s,
 ::         as-of lookups 20s), 87 features. Date split at 2026-01-01.
-::         --if-stale skips the rewrite when those outputs are newer than
-::         the club parquets (and the Elo results file, when one is used).
+::         --if-stale skips the build when the test parquet and meta.json are
+::         newer than the club parquets (and the Elo results file, when used).
+::         The train parquet is rewritten only when its rows change (content
+::         hash in meta.json). Missing Elo is filled with the train-row mean,
+::         so sessions after the cutoff only add test rows: train is unchanged.
 echo   [5a/5b] Building prediction train/test data...
 call :pyrun 5a "%ACBL_PY%" "%~dp0ffbridge_prediction_data.py" --club-dir "%CLUB_OUT%" --output-dir "%CLUB_OUT%" --if-stale
 if errorlevel 1 goto :error
@@ -247,7 +250,10 @@ if errorlevel 1 goto :error
 ::         stopping. Per model: about 10s building shards, 20-32s training,
 ::         7-9s test evaluation. 8,192-row batches for 8 epochs took 144s of
 ::         training and scored 0.7 points lower on both classifiers.
-::         --if-stale skips a target whose .pth is newer than the train parquet.
+::         --if-stale skips a target already trained on the current train
+::         rows (hash in ffbridge_prediction_model_train_hashes.json), so a
+::         day with only new test sessions trains nothing. Kept models keep
+::         their old test metrics in ffbridge_prediction_metrics.json.
 ::         Shards are built in memory and moved to the GPU once per target;
 ::         no shard files are written.
 :: ACCURACY 2026 test (2.43M boards): Declarer_Direction 0.6619 (joint 0.6647),

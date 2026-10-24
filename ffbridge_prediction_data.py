@@ -26,6 +26,7 @@ gap; NS percentage does.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -161,11 +162,32 @@ def find_elo_results(explicit: str | None) -> Path | None:
     return max(found, key=lambda path: path.stat().st_mtime)
 
 
+def frame_content_hash(frame: pl.DataFrame) -> str:
+    """SHA-256 of the column layout and every row, in order.
+
+    Row order is included: the trainer does not shuffle, so a reordered
+    frame trains a different model. ``hash_rows`` is stable within one
+    Polars version; an upgrade changes the hash and causes one retrain.
+    """
+    digest = hashlib.sha256()
+    digest.update(json.dumps([[name, str(dtype)] for name, dtype in frame.schema.items()]).encode())
+    digest.update(frame.hash_rows(seed=0).to_numpy().tobytes())
+    return digest.hexdigest()
+
+
+def previous_train_hash(meta_path: Path) -> str | None:
+    if not meta_path.is_file():
+        return None
+    return json.loads(meta_path.read_text(encoding="utf-8")).get("train_hash")
+
+
 def _outputs_are_fresh(output_dir: Path, sources: list[Path]) -> bool:
-    outputs = [output_dir / TRAIN_NAME, output_dir / TEST_NAME]
+    outputs = [output_dir / TRAIN_NAME, output_dir / TEST_NAME, output_dir / META_NAME]
     if not all(path.is_file() for path in outputs):
         return False
-    oldest_output = min(path.stat().st_mtime for path in outputs)
+    # The train file is rewritten only when its rows change, so its mtime can
+    # be older than the sources. Test and meta are written on every build.
+    oldest_output = min(path.stat().st_mtime for path in outputs[1:])
     newest_source = max(path.stat().st_mtime for path in sources if path.is_file())
     return oldest_output >= newest_source
 
@@ -274,13 +296,18 @@ def _join_deals(club_dir: Path, max_rows: int | None, cutoff: date) -> pl.DataFr
     return frame.rename(RENAMES)
 
 
-def attach_scratch_elo(frame: pl.DataFrame, results_path: Path) -> tuple[pl.DataFrame, bool]:
+def attach_scratch_elo(
+    frame: pl.DataFrame, results_path: Path, cutoff: date
+) -> tuple[pl.DataFrame, bool]:
     """Join pre-session scratch Elo onto the four seats and the two pairs.
 
     Uses Elo *before* the session only. After-session ratings are the result
     of these boards and would leak the target. ``scratch_pair_elo`` is the
     mean of the two *after* ratings, so the pair rating is rebuilt here from
     the two before ratings. The NS pair's ``club_id`` fills ``Club``.
+
+    Missing ratings are filled with the mean over training rows
+    (``Date < cutoff``) only, so new test sessions do not change train rows.
     """
     schema = pl.read_parquet_schema(results_path)
     required = {
@@ -376,8 +403,9 @@ def attach_scratch_elo(frame: pl.DataFrame, results_path: Path) -> tuple[pl.Data
         pl.col("Elo_NS").is_null().cast(pl.Float32).alias("Elo_NS_Missing"),
         pl.col("Elo_EW").is_null().cast(pl.Float32).alias("Elo_EW_Missing"),
     )
+    is_train = pl.col("Date") < cutoff
     for column in BASE_ELO_FEATURES:
-        mean = out.select(pl.col(column).mean()).item()
+        mean = out.select(pl.col(column).filter(is_train).mean()).item()
         fill = 0.0 if mean is None else float(mean)
         out = out.with_columns(pl.col(column).fill_null(fill).fill_nan(fill).cast(pl.Float32))
     out = out.with_columns((pl.col("Elo_NS") - pl.col("Elo_EW")).alias("Elo_Gap"))
@@ -454,7 +482,7 @@ def build_prediction_data(
     used_elo = False
     if elo_results is not None:
         print(f"[5a] Attaching pre-session scratch Elo from {elo_results}")
-        frame, used_elo = attach_scratch_elo(frame, elo_results)
+        frame, used_elo = attach_scratch_elo(frame, elo_results, cutoff)
     else:
         print("[5a] No Elo results parquet found; models will use deal features only.")
         player_ids = [f"Player_ID_{seat}" for seat in "NESW" if f"Player_ID_{seat}" in frame.columns]
@@ -472,13 +500,19 @@ def build_prediction_data(
     output_dir.mkdir(parents=True, exist_ok=True)
     train_path = output_dir / TRAIN_NAME
     test_path = output_dir / TEST_NAME
-    train.write_parquet(train_path)
+    meta_path = output_dir / META_NAME
+    train_hash = frame_content_hash(train)
+    if train_path.is_file() and previous_train_hash(meta_path) == train_hash:
+        print(f"Train rows unchanged (hash {train_hash[:12]}); keeping {train_path.name}.")
+    else:
+        train.write_parquet(train_path)
     test.write_parquet(test_path)
     features = feature_columns(train)
     meta = {
         "built_at": datetime.now(timezone.utc).isoformat(),
         "cutoff": cutoff.isoformat(),
         "train_rows": train.height,
+        "train_hash": train_hash,
         "test_rows": test.height,
         "features": features,
         "targets": list(TARGETS),
@@ -488,7 +522,7 @@ def build_prediction_data(
         "score_target": "Pct_NS",
         "history_tables": [PLAYER_HISTORY_NAME, PAIR_HISTORY_NAME],
     }
-    (output_dir / META_NAME).write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(
         f"Wrote {train_path.name} ({train.height:,} rows) and "
         f"{test_path.name} ({test.height:,} rows), {len(features)} features."

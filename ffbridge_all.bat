@@ -244,21 +244,24 @@ if errorlevel 1 goto :error
 ::         E:\bridge\data\ffbridge\ffbridge_prediction_metrics.json
 ::           (per-target accuracy/MAE, club-rank Spearman per club session
 ::           vs an Elo-gap line, and the joint contract/declarer pick)
-:: TIME:   MEASURED 2026-10-20: 147s for three models
-::         (Declarer_Direction, Contract, Pct_NS) on 7.37M train rows, CUDA
-::         (270s on 2026-10-19). 32,000-row batches, 16 epochs with early
-::         stopping. Per model: about 10s building shards, 20-32s training,
-::         7-9s test evaluation. 8,192-row batches for 8 epochs took 144s of
-::         training and scored 0.7 points lower on both classifiers.
+:: TIME:   MEASURED 2026-10-24: 162s for three models plus the joint pick
+::         (Declarer_Direction 16 epochs, Contract 48, Pct_NS 16) on 7.37M
+::         train rows, CUDA; 216s before with Contract at 96 epochs. Batches
+::         are reshuffled every epoch and the learning rate follows a
+::         one-cycle schedule (warm up, then anneal). An epoch is about 1.2s;
+::         most of the time is building shards and test evaluation.
 ::         --if-stale skips a target already trained on the current train
-::         rows (hash in ffbridge_prediction_model_train_hashes.json), so a
-::         day with only new test sessions trains nothing. Kept models keep
+::         rows with the current settings (row hash + settings hash in
+::         ffbridge_prediction_model_train_hashes.json), so a day with only
+::         new test sessions trains nothing and a settings change retrains. Kept models keep
 ::         their old test metrics in ffbridge_prediction_metrics.json.
 ::         Shards are built in memory and moved to the GPU once per target;
 ::         no shard files are written.
-:: ACCURACY 2026 test (2.43M boards): Declarer_Direction 0.6619 (joint 0.6647),
-::         Contract 0.3871 (joint 0.3887), Pct_NS MAE 0.2316, club-rank
-::         Spearman 0.529 vs Elo line 0.511 (12,105 club sessions).
+:: ACCURACY 2026 test (2.43M boards), 2026-10-24: Declarer_Direction 0.6756
+::         (joint 0.6825), Contract 0.4160 (joint 0.4113), Pct_NS MAE 0.2316,
+::         club-rank Spearman 0.530 vs Elo line 0.511 (12,105 club sessions).
+::         Unshuffled, constant-lr baseline on the same data: 0.6612 (0.6773),
+::         0.4122 (0.4060), MAE 0.2315, Spearman 0.529.
 :: PUBLISH: ..\elo\u.bat (run by ..\u_all.bat) copies SavedModels to src\data
 ::         and X1; restart the postmortem container to stage them.
 echo   [5c] Training prediction models...

@@ -145,6 +145,20 @@ class StalenessTests(unittest.TestCase):
             self.assertFalse(train._fresh_model(models, target, None, hashes))
             self.assertFalse(train._fresh_model(models, "Contract", "abc", hashes))
 
+    def test_stamp_changes_with_training_settings(self):
+        base = train._training_stamp("rows", "Contract", 500_000)
+        self.assertTrue(base.startswith("rows:"))
+        self.assertEqual(train._training_stamp("rows", "Contract", 500_000), base)
+        self.assertNotEqual(train._training_stamp("rows", "Contract", 250_000), base)
+        self.assertNotEqual(train._training_stamp("rows", "Pct_NS", 500_000), base)
+        self.assertIsNone(train._training_stamp(None, "Contract", 500_000))
+        original = train._hyperparameters
+        try:
+            train._hyperparameters = lambda target: {**original(target), "epochs": 1}
+            self.assertNotEqual(train._training_stamp("rows", "Contract", 500_000), base)
+        finally:
+            train._hyperparameters = original
+
 
 class RankingEvaluationTests(unittest.TestCase):
     def test_per_board_centering_removes_a_board_subset_artifact(self):

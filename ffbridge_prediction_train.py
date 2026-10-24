@@ -18,6 +18,7 @@ columns, not thousands. Each target has its own default epochs; pass
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -75,6 +76,11 @@ def _hyperparameters(target: str) -> dict:
     # 32,000-row batches with twice the 8,192-row learning rates and 16 epochs:
     # 2026-10-20 benchmark, 96s vs 144s training, both classifiers +0.7 points,
     # Pct_NS MAE and club-rank Spearman unchanged.
+    # Shuffle + one-cycle lr (peak = "lr"): train rows are in session order, so
+    # unshuffled batches are correlated. 2026-10-24 benchmark, same data, 2.43M
+    # test rows: Declarer_Direction 0.6612 -> 0.6756, Contract 0.4122 -> 0.4160
+    # in 48 epochs instead of 96 (24 epochs: 0.4106), Pct_NS unchanged
+    # (MAE 0.2315 -> 0.2316, club-rank Spearman 0.529 -> 0.530).
     if target == "Declarer_Direction":
         return {
             "layers": [512, 256, 128],
@@ -82,6 +88,8 @@ def _hyperparameters(target: str) -> dict:
             "lr": 2e-3,
             "weight_decay": 0.0,
             "bs": 32000,
+            "shuffle": True,
+            "lr_schedule": "onecycle",
             "y_range": None,
             "epochs": 16,
         }
@@ -91,14 +99,17 @@ def _hyperparameters(target: str) -> dict:
         # 38.9% -> 40.8% and declarer seat 66.8% -> 68.0%, and cuts level-too-low
         # 26.3% -> 24.5% for +0.5 points too-high under the bucket-first pick.
         # 2048-wide layers overfit by epoch 30; lower dropout was no better.
+        # With shuffle + one-cycle, 48 epochs beat 96 constant-lr epochs.
         return {
             "layers": [1024, 512, 256],
             "dropout": 0.20,
             "lr": 6e-4,
             "weight_decay": 0.0,
             "bs": 32000,
+            "shuffle": True,
+            "lr_schedule": "onecycle",
             "y_range": None,
-            "epochs": 96,
+            "epochs": 48,
         }
     return {
         "layers": [256, 128, 64],
@@ -106,6 +117,8 @@ def _hyperparameters(target: str) -> dict:
         "lr": 6e-4,
         "weight_decay": 1e-4,
         "bs": 32000,
+        "shuffle": True,
+        "lr_schedule": "onecycle",
         "y_range": None,
         "epochs": 16,
     }
@@ -190,15 +203,28 @@ def _checkpoint_key(models_dir: Path, target: str) -> str:
     return str((models_dir / f"{_model_name(target)}.pth").resolve())
 
 
-def _fresh_model(
-    models_dir: Path, target: str, train_hash: str | None, trained_hashes: dict[str, str]
-) -> bool:
-    """A model is fresh when it was trained on train rows with this content hash."""
+def _training_stamp(train_hash: str | None, target: str, shard_rows: int) -> str | None:
+    """Train-row hash plus a hash of the target's training settings.
+
+    A settings change (epochs, lr, shuffle, ...) retrains the model even when
+    the train rows are unchanged. ``shard_rows`` is included because the last
+    shard is the validation set.
+    """
     if train_hash is None:
+        return None
+    settings = json.dumps({**_hyperparameters(target), "shard_rows": shard_rows}, sort_keys=True)
+    return f"{train_hash}:{hashlib.sha256(settings.encode()).hexdigest()[:16]}"
+
+
+def _fresh_model(
+    models_dir: Path, target: str, stamp: str | None, trained_hashes: dict[str, str]
+) -> bool:
+    """A model is fresh when it was trained with this stamp (rows and settings)."""
+    if stamp is None:
         return False
     if not (models_dir / f"{_model_name(target)}.pth").is_file():
         return False
-    return trained_hashes.get(_checkpoint_key(models_dir, target)) == train_hash
+    return trained_hashes.get(_checkpoint_key(models_dir, target)) == stamp
 
 
 def _score(actual: pl.Series, predicted: pl.Series, target: str) -> dict:
@@ -375,6 +401,8 @@ def train_one(
         verbose=True,
         resident_data=True,
         shards=shards,
+        shuffle=hp["shuffle"],
+        lr_schedule=hp["lr_schedule"],
     )
     del shards
     trained = time.perf_counter()
@@ -565,8 +593,9 @@ def _run(args: argparse.Namespace) -> int:
     trained_hashes = _load_train_hashes(args.data_dir)
     pending = []
     for target in targets:
-        if args.if_stale and _fresh_model(models_dir, target, train_hash, trained_hashes):
-            print(f"Keeping {_model_name(target)}.pth; train rows are unchanged since it was trained.")
+        stamp = _training_stamp(train_hash, target, args.shard_rows)
+        if args.if_stale and _fresh_model(models_dir, target, stamp, trained_hashes):
+            print(f"Keeping {_model_name(target)}.pth; train rows and settings are unchanged.")
             continue
         pending.append(target)
     if not pending:
@@ -600,8 +629,9 @@ def _run(args: argparse.Namespace) -> int:
         # Saved after each model, so an interrupted run keeps what finished.
         # A run with --epochs is not a default model; leave it marked stale.
         key = _checkpoint_key(models_dir, target)
-        if train_hash is not None and args.epochs is None:
-            trained_hashes[key] = train_hash
+        stamp = _training_stamp(train_hash, target, args.shard_rows)
+        if stamp is not None and args.epochs is None:
+            trained_hashes[key] = stamp
         else:
             trained_hashes.pop(key, None)
         _save_train_hashes(args.data_dir, trained_hashes)

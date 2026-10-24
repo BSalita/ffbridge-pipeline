@@ -18,3 +18,5 @@ ffbridge_all.bat
 ffbridge_recent.bat day
 set FFBRIDGE_SESSION_LIMIT=50 && ffbridge_all.bat
 ```
+
+Known open issues and speed-up ideas: [OPEN_ISSUES.md](OPEN_ISSUES.md).

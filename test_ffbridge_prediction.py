@@ -155,6 +155,18 @@ class StalenessTests(unittest.TestCase):
             self.assertFalse(train._fresh_model(models, target, None, hashes))
             self.assertFalse(train._fresh_model(models, "Contract", "abc", hashes))
 
+    def test_metrics_are_rescored_only_when_test_rows_change(self):
+        self.assertTrue(train._metrics_are_stale(None, "t1"))
+        self.assertTrue(train._metrics_are_stale({"accuracy": 0.5}, "t1"))
+        self.assertTrue(train._metrics_are_stale({"test_hash": "t0"}, "t1"))
+        self.assertFalse(train._metrics_are_stale({"test_hash": "t1"}, "t1"))
+        # No test hash recorded by 5a: staleness unknown, nothing re-scored.
+        self.assertFalse(train._metrics_are_stale({"test_hash": "t0"}, None))
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(train._current_test_hash(Path(tmp)))
+            (Path(tmp) / data.META_NAME).write_text('{"test_hash": "abc"}')
+            self.assertEqual(train._current_test_hash(Path(tmp)), "abc")
+
     def test_stamp_changes_with_training_settings(self):
         base = train._training_stamp("rows", "Contract", 500_000)
         self.assertTrue(base.startswith("rows:"))

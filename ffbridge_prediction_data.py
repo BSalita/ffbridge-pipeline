@@ -529,6 +529,8 @@ def build_prediction_data(
         "train_rows": train.height,
         "train_hash": train_hash,
         "test_rows": test.height,
+        # 5c re-scores kept models when this changes.
+        "test_hash": frame_content_hash(test),
         "features": features,
         "targets": list(TARGETS),
         "elo_results": str(elo_results) if used_elo and elo_results else None,

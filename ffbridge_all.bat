@@ -257,8 +257,10 @@ if errorlevel 1 goto :error
 ::         --if-stale skips a target already trained on the current train
 ::         rows with the current settings (row hash + settings hash in
 ::         ffbridge_prediction_model_train_hashes.json), so a day with only
-::         new test sessions trains nothing and a settings change retrains. Kept models keep
-::         their old test metrics in ffbridge_prediction_metrics.json.
+::         new test sessions trains nothing and a settings change retrains.
+::         Kept models are re-scored when the test rows changed (test_hash
+::         in meta.json vs each metrics entry): 21s for all three plus the
+::         joint pick, against about 3 minutes to retrain.
 ::         Shards are built in memory and moved to the GPU once per target;
 ::         no shard files are written.
 :: ACCURACY 2026 test (2.43M boards), 2026-10-24: Declarer_Direction 0.6756

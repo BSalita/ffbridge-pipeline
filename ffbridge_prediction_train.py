@@ -183,6 +183,25 @@ def _current_train_hash(data_dir: Path) -> str | None:
     return json.loads(meta_path.read_text(encoding="utf-8")).get("train_hash")
 
 
+def _current_test_hash(data_dir: Path) -> str | None:
+    """Content hash of the test parquet, written by ffbridge_prediction_data.py."""
+    meta_path = data_dir / META_NAME
+    if not meta_path.is_file():
+        return None
+    return json.loads(meta_path.read_text(encoding="utf-8")).get("test_hash")
+
+
+def _metrics_are_stale(entry: dict | None, test_hash: str | None) -> bool:
+    """Metrics need recomputing when missing or computed on other test rows.
+
+    Without a test hash (meta from before this was recorded) staleness is
+    unknown, so nothing is re-scored.
+    """
+    if test_hash is None:
+        return False
+    return entry is None or entry.get("test_hash") != test_hash
+
+
 def _load_train_hashes(data_dir: Path) -> dict[str, str]:
     path = data_dir / TRAIN_HASHES_NAME
     if not path.is_file():
@@ -342,6 +361,53 @@ def evaluate_pct_ns_ranking(
     return quality
 
 
+def evaluate_one(
+    train_df: pl.DataFrame,
+    test_df: pl.DataFrame,
+    target: str,
+    models_dir: Path,
+    device: str,
+) -> dict:
+    """Test metrics for the saved model of ``target``.
+
+    ``train_df`` is used only for the Pct_NS Elo-gap baseline, so for Pct_NS
+    it needs just Elo_Gap and Pct_NS.
+    """
+    from mlBridge.mlBridgeAiLib import predict_model
+
+    model_name = _model_name(target)
+    test_rows = test_df
+    if target == "Pct_NS":
+        test_rows = test_df.filter(pl.col(target).is_not_null() & pl.col(target).is_finite())
+    evaluation = prepare_target_frame(test_rows, target)
+    features = evaluation.drop(target)
+    predicted = predict_model(
+        models_dir,
+        model_name,
+        features,
+        device=device,
+        strict_validation=True,
+        parity_drop_non_finite=False,
+    )
+    pred_column = f"{target}_Pred"
+    if pred_column not in predicted.columns:
+        raise RuntimeError(f"predict_model did not return {pred_column}; columns={predicted.columns}")
+    if predicted.height != evaluation.height:
+        raise RuntimeError(
+            f"Prediction row count {predicted.height:,} != test rows {evaluation.height:,} for {target}"
+        )
+    metrics = _score(evaluation[target], predicted[pred_column], target)
+    if target == "Pct_NS":
+        if evaluation.height != test_rows.height:
+            raise RuntimeError(
+                f"Pct_NS evaluation rows {evaluation.height:,} != test rows {test_rows.height:,}"
+            )
+        metrics["ranking"] = evaluate_pct_ns_ranking(
+            test_rows, predicted[pred_column], elo_gap_line(train_df)
+        )
+    return metrics
+
+
 def train_one(
     train_df: pl.DataFrame,
     test_df: pl.DataFrame,
@@ -357,7 +423,6 @@ def train_one(
     from mlBridge.mlBridgeAiLib import (
         build_torch_shards,
         generate_and_save_schema,
-        predict_model,
         train_model_from_shards,
     )
 
@@ -407,35 +472,7 @@ def train_one(
     del shards
     trained = time.perf_counter()
 
-    test_rows = test_df
-    if target == "Pct_NS":
-        test_rows = test_df.filter(pl.col(target).is_not_null() & pl.col(target).is_finite())
-    evaluation = prepare_target_frame(test_rows, target)
-    features = evaluation.drop(target)
-    predicted = predict_model(
-        models_dir,
-        model_name,
-        features,
-        device=device,
-        strict_validation=True,
-        parity_drop_non_finite=False,
-    )
-    pred_column = f"{target}_Pred"
-    if pred_column not in predicted.columns:
-        raise RuntimeError(f"predict_model did not return {pred_column}; columns={predicted.columns}")
-    if predicted.height != evaluation.height:
-        raise RuntimeError(
-            f"Prediction row count {predicted.height:,} != test rows {evaluation.height:,} for {target}"
-        )
-    metrics = _score(evaluation[target], predicted[pred_column], target)
-    if target == "Pct_NS":
-        if evaluation.height != test_rows.height:
-            raise RuntimeError(
-                f"Pct_NS evaluation rows {evaluation.height:,} != test rows {test_rows.height:,}"
-            )
-        metrics["ranking"] = evaluate_pct_ns_ranking(
-            test_rows, predicted[pred_column], elo_gap_line(train_df)
-        )
+    metrics = evaluate_one(train_df, test_df, target, models_dir, device)
     metrics.update(
         {
             "target": target,
@@ -598,14 +635,6 @@ def _run(args: argparse.Namespace) -> int:
             print(f"Keeping {_model_name(target)}.pth; train rows and settings are unchanged.")
             continue
         pending.append(target)
-    if not pending:
-        print("Prediction models are up to date.")
-        return 0
-
-    print(f"Loading {train_path.name}...")
-    train_df = pl.read_parquet(train_path)
-    print(f"Loading {test_path.name}...")
-    test_df = pl.read_parquet(test_path)
 
     all_metrics = []
     metrics_path = args.data_dir / "ffbridge_prediction_metrics.json"
@@ -615,6 +644,41 @@ def _run(args: argparse.Namespace) -> int:
         except json.JSONDecodeError:
             all_metrics = []
     by_target = {item.get("target"): item for item in all_metrics if isinstance(item, dict)}
+
+    # Kept models are re-scored when the test rows changed since their
+    # metrics were computed (new sessions after the cutoff add test rows).
+    test_hash = _current_test_hash(args.data_dir)
+    rescore = [
+        target
+        for target in targets
+        if target not in pending and _metrics_are_stale(by_target.get(target), test_hash)
+        and (models_dir / f"{_model_name(target)}.pth").is_file()
+    ]
+    classifiers = ("Contract", "Declarer_Direction")
+    joint_stale = all(
+        (models_dir / f"{_model_name(name)}.pth").is_file() for name in classifiers
+    ) and (
+        any(name in pending or name in rescore for name in classifiers)
+        or _metrics_are_stale(by_target.get("Joint_Contract_Declarer"), test_hash)
+    )
+    if not pending and not rescore and not joint_stale:
+        print("Prediction models and their test metrics are up to date.")
+        return 0
+
+    if pending:
+        print(f"Loading {train_path.name}...")
+        train_df = pl.read_parquet(train_path)
+    else:
+        # Only the Pct_NS Elo-gap baseline reads the train rows.
+        train_df = pl.read_parquet(train_path, columns=["Elo_Gap", "Pct_NS"])
+    print(f"Loading {test_path.name}...")
+    test_df = pl.read_parquet(test_path)
+
+    for target in rescore:
+        print(f"Re-scoring kept {_model_name(target)}.pth on the current test rows...")
+        metrics = evaluate_one(train_df, test_df, target, models_dir, device)
+        by_target[target] = {**by_target.get(target, {}), **metrics, "test_hash": test_hash}
+        print(f"{target} test metrics: {metrics}")
 
     for target in pending:
         by_target[target] = train_one(
@@ -626,6 +690,7 @@ def _run(args: argparse.Namespace) -> int:
             device=device,
             shard_rows=args.shard_rows,
         )
+        by_target[target]["test_hash"] = test_hash
         # Saved after each model, so an interrupted run keeps what finished.
         # A run with --epochs is not a default model; leave it marked stale.
         key = _checkpoint_key(models_dir, target)
@@ -635,11 +700,11 @@ def _run(args: argparse.Namespace) -> int:
         else:
             trained_hashes.pop(key, None)
         _save_train_hashes(args.data_dir, trained_hashes)
-    classifiers = ("Contract", "Declarer_Direction")
-    if any(name in pending for name in classifiers) and all(
-        (models_dir / f"{_model_name(name)}.pth").is_file() for name in classifiers
-    ):
-        by_target["Joint_Contract_Declarer"] = evaluate_joint_contract_declarer(test_df, models_dir, device)
+    if joint_stale:
+        by_target["Joint_Contract_Declarer"] = {
+            **evaluate_joint_contract_declarer(test_df, models_dir, device),
+            "test_hash": test_hash,
+        }
     ordered = [by_target[name] for name in (*TARGETS, "Joint_Contract_Declarer") if name in by_target]
     metrics_path.write_text(json.dumps(ordered, indent=2), encoding="utf-8")
     meta_path = args.data_dir / META_NAME
